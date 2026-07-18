@@ -65,6 +65,8 @@ with each nonce so the pool can score shares without repeating the full
 million-iteration extension on the CPU.
 Workers keep draining Stratum replies while CUDA kernels are running, so accepted
 share responses do not wait behind long GPU batches.
+Buffered Stratum replies are fully drained before waiting on the socket again,
+which prevents pending shares from freezing after a burst of accepted responses.
 Ctrl+C asks all GPU workers to stop and force-kills any worker that remains
 inside a long CUDA launch for more than a couple seconds.
 

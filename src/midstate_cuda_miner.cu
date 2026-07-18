@@ -33,7 +33,7 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_signal_count = 0;
-static constexpr const char *APP_VERSION = "v0.1.14";
+static constexpr const char *APP_VERSION = "v0.1.15";
 static constexpr uint32_t MAX_CANDIDATES = 512;
 
 static void on_sigint(int) {
@@ -510,6 +510,10 @@ struct LineReader {
         buf.reserve(65536);
     }
 
+    bool has_buffered_line() const {
+        return buf.find('\n') != std::string::npos;
+    }
+
     bool read_line(std::string &line) {
         line.clear();
         while (true) {
@@ -856,18 +860,20 @@ int main(int argc, char **argv) {
 
         auto drain_pool = [&](long sec, long usec) -> bool {
             while (!g_stop) {
-                fd_set rfds;
-                FD_ZERO(&rfds);
-                FD_SET(fd, &rfds);
-                struct timeval tv;
-                tv.tv_sec = sec;
-                tv.tv_usec = usec;
-                int sr = select(fd + 1, &rfds, nullptr, nullptr, &tv);
-                if (sr < 0) {
-                    if (errno == EINTR) return true;
-                    return false;
+                if (!line_reader.has_buffered_line()) {
+                    fd_set rfds;
+                    FD_ZERO(&rfds);
+                    FD_SET(fd, &rfds);
+                    struct timeval tv;
+                    tv.tv_sec = sec;
+                    tv.tv_usec = usec;
+                    int sr = select(fd + 1, &rfds, nullptr, nullptr, &tv);
+                    if (sr < 0) {
+                        if (errno == EINTR) return true;
+                        return false;
+                    }
+                    if (sr == 0 || !FD_ISSET(fd, &rfds)) return true;
                 }
-                if (sr == 0 || !FD_ISSET(fd, &rfds)) return true;
                 std::string line;
                 if (!line_reader.read_line(line)) return false;
                 process_pool_line(line);
