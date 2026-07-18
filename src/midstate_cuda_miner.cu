@@ -370,10 +370,28 @@ int main(int argc, char **argv) {
             children.push_back(pid);
         }
 
-        int status = 0;
         int rc = 0;
-        for (pid_t pid : children) {
-            if (waitpid(pid, &status, 0) >= 0 && status != 0) rc = 1;
+        while (!children.empty()) {
+            if (g_stop) {
+                for (pid_t pid : children) {
+                    kill(pid, SIGTERM);
+                }
+            }
+
+            for (auto it = children.begin(); it != children.end();) {
+                int status = 0;
+                pid_t done = waitpid(*it, &status, WNOHANG);
+                if (done == *it) {
+                    if (status != 0) rc = 1;
+                    it = children.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            if (!children.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
         }
         return rc;
     }
