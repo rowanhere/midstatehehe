@@ -51,6 +51,8 @@ Auto mode also partitions nonce space across GPUs so cards do not duplicate
 each other's shares on the same pool job.
 Auto mode shows a live terminal dashboard with current and average hashrate,
 accepted/rejected shares, submitted candidates, active job, and per-GPU status.
+The CUDA kernel returns multiple candidates per batch, so easy share targets do
+not waste valid shares that occur after the first hit in a launch.
 
 For plain line logs:
 

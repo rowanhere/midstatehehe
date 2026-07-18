@@ -29,6 +29,7 @@
 #include <vector>
 
 static volatile sig_atomic_t g_stop = 0;
+static constexpr uint32_t MAX_CANDIDATES = 512;
 
 static void on_sigint(int) {
     g_stop = 1;
@@ -60,10 +61,10 @@ struct Options {
 };
 
 struct Candidate {
-    uint32_t found;
-    uint32_t _pad;
-    uint64_t nonce;
-    uint8_t hash[32];
+    uint32_t count;
+    uint32_t cap;
+    uint64_t nonce[MAX_CANDIDATES];
+    uint8_t hash[MAX_CANDIDATES][32];
 };
 
 __device__ __forceinline__ uint32_t rotr32(uint32_t x, uint32_t n) {
@@ -174,7 +175,6 @@ __global__ void mine_kernel(
     uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
 
     for (uint64_t off = gid; off < n; off += stride) {
-        if (cand->found) return;
         uint64_t nonce = base + off;
         uint8_t h[32];
         blake3_40(midstate, nonce, h);
@@ -182,12 +182,12 @@ __global__ void mine_kernel(
             blake3_32_inplace(h);
         }
         if (hash_less_than(h, target)) {
-            if (atomicCAS(&cand->found, 0u, 1u) == 0u) {
-                cand->nonce = nonce;
+            uint32_t idx = atomicAdd(&cand->count, 1u);
+            if (idx < cand->cap && idx < MAX_CANDIDATES) {
+                cand->nonce[idx] = nonce;
                 #pragma unroll
-                for (int j = 0; j < 32; j++) cand->hash[j] = h[j];
+                for (int j = 0; j < 32; j++) cand->hash[idx][j] = h[j];
             }
-            return;
         }
     }
 }
@@ -680,6 +680,7 @@ int main(int argc, char **argv) {
             opt.address + "\",\"" + opt.worker + "\"]}\n";
         send_all(fd, sub);
         send_all(fd, auth);
+        auto connected_at = std::chrono::steady_clock::now();
 
         while (!g_stop) {
             fd_set rfds;
@@ -726,9 +727,19 @@ int main(int argc, char **argv) {
                 }
             }
 
-            if (!have_job) continue;
+            if (!have_job) {
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - connected_at).count() > 15) {
+                    fs.status = "no job reconnect";
+                    write_stats_file(opt, fs);
+                    if (!opt.quiet) fprintf(stderr, "no mining.notify after handshake; reconnecting\n");
+                    break;
+                }
+                continue;
+            }
 
             h_cand = {};
+            h_cand.cap = MAX_CANDIDATES;
             CUDA_CHECK(cudaMemcpy(d_cand, &h_cand, sizeof(h_cand), cudaMemcpyHostToDevice));
             mine_kernel<<<opt.blocks, opt.threads>>>(d_midstate, d_target, base, opt.batch, iterations, d_cand);
             CUDA_CHECK(cudaGetLastError());
@@ -766,20 +777,30 @@ int main(int argc, char **argv) {
                 checked = 0;
             }
 
-            if (h_cand.found) {
-                candidates++;
+            uint32_t found_count = h_cand.count;
+            if (found_count > MAX_CANDIDATES) found_count = MAX_CANDIDATES;
+            if (found_count > 0) {
+                candidates += found_count;
                 fs.candidates = candidates;
                 fs.status = "candidate";
                 write_stats_file(opt, fs);
-                if (!opt.quiet) fprintf(stderr, "candidate nonce=%" PRIu64 " hash=%s\n", h_cand.nonce, hash_hex(h_cand.hash).c_str());
-                char buf[512];
-                snprintf(buf, sizeof(buf),
-                    "{\"id\":2,\"method\":\"mining.submit\",\"params\":[\"%s\",%" PRIu64 ",%" PRIu64 "]}\n",
-                    opt.address.c_str(), job_id, h_cand.nonce);
-                submitted++;
-                fs.submitted = submitted;
-                write_stats_file(opt, fs);
-                if (!send_all(fd, buf)) break;
+                if (!opt.quiet) fprintf(stderr, "candidates=%u first_nonce=%" PRIu64 " first_hash=%s\n",
+                    found_count, h_cand.nonce[0], hash_hex(h_cand.hash[0]).c_str());
+                bool submit_ok = true;
+                for (uint32_t i = 0; i < found_count; i++) {
+                    char buf[512];
+                    snprintf(buf, sizeof(buf),
+                        "{\"id\":2,\"method\":\"mining.submit\",\"params\":[\"%s\",%" PRIu64 ",%" PRIu64 "]}\n",
+                        opt.address.c_str(), job_id, h_cand.nonce[i]);
+                    submitted++;
+                    fs.submitted = submitted;
+                    write_stats_file(opt, fs);
+                    if (!send_all(fd, buf)) {
+                        submit_ok = false;
+                        break;
+                    }
+                }
+                if (!submit_ok) break;
             }
             base += opt.batch * (uint64_t)opt.lane_count;
         }
