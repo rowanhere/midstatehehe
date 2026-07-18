@@ -21,12 +21,14 @@ TARGET := midstate-cuda-miner
 
 all: $(TARGET)
 
-$(TARGET): src/midstate_cuda_miner.cu src/stratum_reader.hpp
+$(TARGET): src/midstate_cuda_miner.cu src/stratum_reader.hpp src/stratum_protocol.hpp
 	$(NVCC) $(NVCCFLAGS) $(GENCODE) -std=c++17 -o $@ $< $(LDFLAGS)
 
-test: tests/stratum_reader_test.cpp src/stratum_reader.hpp
+test: tests/stratum_reader_test.cpp tests/stratum_protocol_test.cpp src/stratum_reader.hpp src/stratum_protocol.hpp
 	$(CXX) -O2 -std=c++17 -pthread -o stratum-reader-test tests/stratum_reader_test.cpp
 	./stratum-reader-test
+	$(CXX) -O2 -std=c++17 -pthread -o stratum-protocol-test tests/stratum_protocol_test.cpp
+	./stratum-protocol-test
 
 clean:
-	rm -f $(TARGET) stratum-reader-test
+	rm -f $(TARGET) stratum-reader-test stratum-protocol-test

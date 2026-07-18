@@ -43,6 +43,13 @@ int main() {
     assert(reader.pop(line, std::chrono::seconds(1)));
     assert(line == "{\"id\":1101,\"result\":false}");
 
+    const std::string large_notify =
+        "{\"id\":null,\"method\":\"mining.notify\",\"padding\":\"" +
+        std::string(12000, 'x') + "\"}";
+    send_text(sockets[1], large_notify + "\n");
+    assert(reader.pop(line, std::chrono::seconds(1)));
+    assert(line == large_notify);
+
     close(sockets[1]);
     for (int i = 0; i < 100 && reader.is_alive(); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));

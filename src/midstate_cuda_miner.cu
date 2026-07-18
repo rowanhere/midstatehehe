@@ -25,7 +25,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -33,12 +32,12 @@
 #include <vector>
 
 #include "stratum_reader.hpp"
+#include "stratum_protocol.hpp"
 
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_signal_count = 0;
-static constexpr const char *APP_VERSION = "v0.1.16";
+static constexpr const char *APP_VERSION = "v0.1.17";
 static constexpr uint32_t MAX_CANDIDATES = 512;
-static constexpr auto SHARE_RESPONSE_TIMEOUT = std::chrono::seconds(15);
 
 static void on_sigint(int) {
     g_stop = 1;
@@ -52,6 +51,7 @@ static void install_signal_handlers() {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
+    signal(SIGPIPE, SIG_IGN);
 }
 
 #define CUDA_CHECK(x) do { \
@@ -75,8 +75,10 @@ struct Options {
     int lane_count = 1;
     uint32_t max_submit_per_batch = 1;
     uint32_t max_outstanding_shares = 8;
+    uint32_t share_response_timeout = 60;
     bool dashboard = true;
     bool quiet = false;
+    bool protocol_debug = false;
     bool child = false;
     std::string stats_dir;
 };
@@ -218,9 +220,10 @@ static void usage(const char *argv0) {
         "Usage: %s -o stratum+tcp://host:port -a ADDRESS [-w worker] [-d device]\n"
         "          [--blocks N] [--threads N] [--batch N] [--iters N]\n"
         "          [--max-submit-per-batch N] [--max-outstanding-shares N]\n"
-        "          [--no-dashboard]\n\n"
+        "          [--share-response-timeout N] [--protocol-debug] [--no-dashboard]\n\n"
         "Defaults: all GPUs, --blocks 4096 --threads 128 --batch 524288 --iters 1000000\n"
-        "          --max-submit-per-batch 1 --max-outstanding-shares 8\n",
+        "          --max-submit-per-batch 1 --max-outstanding-shares 8\n"
+        "          --share-response-timeout 60\n",
         argv0);
 }
 
@@ -248,9 +251,11 @@ static bool parse_args(int argc, char **argv, Options &o, uint32_t &iters) {
         else if (a == "--lane-count") o.lane_count = atoi(need(a.c_str()));
         else if (a == "--max-submit-per-batch") o.max_submit_per_batch = (uint32_t)strtoul(need(a.c_str()), nullptr, 10);
         else if (a == "--max-outstanding-shares") o.max_outstanding_shares = (uint32_t)strtoul(need(a.c_str()), nullptr, 10);
+        else if (a == "--share-response-timeout") o.share_response_timeout = (uint32_t)strtoul(need(a.c_str()), nullptr, 10);
         else if (a == "--stats-dir") o.stats_dir = need(a.c_str());
         else if (a == "--no-dashboard") o.dashboard = false;
         else if (a == "--quiet") o.quiet = true;
+        else if (a == "--protocol-debug") o.protocol_debug = true;
         else if (a == "--child") o.child = true;
         else if (a == "--version") { printf("midstate-cuda-miner %s\n", APP_VERSION); exit(0); }
         else if (a == "-h" || a == "--help") { usage(argv[0]); exit(0); }
@@ -511,24 +516,6 @@ static bool send_all(int fd, const std::string &s) {
     return true;
 }
 
-static int hexval(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-static bool hex_to_32(const std::string &hex, uint8_t out[32]) {
-    if (hex.size() != 64) return false;
-    for (int i = 0; i < 32; i++) {
-        int hi = hexval(hex[i * 2]);
-        int lo = hexval(hex[i * 2 + 1]);
-        if (hi < 0 || lo < 0) return false;
-        out[i] = (uint8_t)((hi << 4) | lo);
-    }
-    return true;
-}
-
 static std::string hash_hex(const uint8_t h[32]) {
     static const char *digits = "0123456789abcdef";
     std::string out;
@@ -538,43 +525,6 @@ static std::string hash_hex(const uint8_t h[32]) {
         out[i * 2 + 1] = digits[h[i] & 15];
     }
     return out;
-}
-
-static bool parse_notify(const std::string &line, uint64_t &job_id, uint8_t midstate[32]) {
-    if (line.find("mining.notify") == std::string::npos) return false;
-    size_t params = line.find("\"params\"");
-    if (params == std::string::npos) return false;
-    size_t p = line.find('[', params);
-    if (p == std::string::npos) return false;
-    p++;
-    while (p < line.size() && isspace((unsigned char)line[p])) p++;
-    size_t num_start = p;
-    while (p < line.size() && line[p] >= '0' && line[p] <= '9') p++;
-    if (p == num_start) return false;
-    job_id = strtoull(line.substr(num_start, p - num_start).c_str(), nullptr, 10);
-    p = line.find('"', p);
-    if (p == std::string::npos || p + 65 > line.size()) return false;
-    std::string hex = line.substr(p + 1, 64);
-    return hex_to_32(hex, midstate);
-}
-
-static bool parse_submit_response(const std::string &line, uint64_t &id, bool &accepted) {
-    std::regex id_re("\"id\"\\s*:\\s*([0-9]+)");
-    std::regex result_re("\"result\"\\s*:\\s*(true|false)");
-    std::smatch id_m;
-    std::smatch result_m;
-    if (!std::regex_search(line, id_m, id_re)) return false;
-    if (!std::regex_search(line, result_m, result_re)) return false;
-    id = strtoull(id_m[1].str().c_str(), nullptr, 10);
-    accepted = result_m[1].str() == "true";
-    return true;
-}
-
-static bool has_non_null_error(const std::string &line) {
-    std::regex re("\"error\"\\s*:\\s*(null|\"[^\"]*\"|\\[[^\\]]*\\]|\\{[^\\}]*\\})");
-    std::smatch m;
-    if (!std::regex_search(line, m, re)) return false;
-    return m[1].str() != "null";
 }
 
 int main(int argc, char **argv) {
@@ -694,6 +644,7 @@ int main(int argc, char **argv) {
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, opt.device));
     if (!opt.quiet) {
+        fprintf(stderr, "midstate-cuda-miner %s\n", APP_VERSION);
         fprintf(stderr, "CUDA device %d: %s, cc %d.%d\n", opt.device, prop.name, prop.major, prop.minor);
     }
 
@@ -728,6 +679,8 @@ int main(int argc, char **argv) {
     uint64_t base = base_seed + (uint64_t)opt.lane_index * opt.batch;
     uint64_t job_id = 0;
     uint8_t job_midstate[32] = {0};
+    uint8_t network_target[32];
+    memset(network_target, 0xff, sizeof(network_target));
     bool have_job = false;
     uint64_t accepted = 0, rejected = 0, checked = 0, total_hashes = 0, submitted = 0, candidates = 0;
     uint64_t next_submit_id = 1000;
@@ -762,26 +715,40 @@ int main(int argc, char **argv) {
         if (!opt.quiet) fprintf(stderr, "connected to %s:%s\n", host.c_str(), port.c_str());
         StratumReader stratum_reader(fd);
 
-        std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n";
-        std::string auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" +
+        std::string auth = "{\"id\":1,\"method\":\"mining.authorize\",\"params\":[\"" +
             opt.address + "\",\"" + opt.worker + "\"]}\n";
-        send_all(fd, sub);
         send_all(fd, auth);
         auto connected_at = std::chrono::steady_clock::now();
+        auto last_job_request = connected_at;
+        if (opt.protocol_debug) fprintf(stderr, "protocol tx authorize bytes=%zu\n", auth.size());
 
         auto process_pool_line = [&](const std::string &line) -> bool {
             uint64_t jid;
             uint8_t ms[32];
-            if (parse_notify(line, jid, ms)) {
+            uint8_t target[32];
+            if (opt.protocol_debug) {
+                fprintf(stderr, "protocol rx bytes=%zu prefix=%.120s\n", line.size(), line.c_str());
+            }
+            if (parse_notify(line, jid, ms, target)) {
                 job_id = jid;
                 memcpy(job_midstate, ms, 32);
+                memcpy(network_target, target, 32);
                 CUDA_CHECK(cudaMemcpy(d_midstate, job_midstate, 32, cudaMemcpyHostToDevice));
                 have_job = true;
                 fs.job = std::to_string(job_id);
                 fs.status = "mining";
                 write_stats_file(opt, fs);
-                if (!opt.quiet) fprintf(stderr, "new job %" PRIu64 " midstate=%s\n", job_id, hash_hex(job_midstate).c_str());
+                if (!opt.quiet) {
+                    fprintf(stderr, "new job %" PRIu64 " midstate=%s target=%s\n",
+                        job_id, hash_hex(job_midstate).c_str(), hash_hex(network_target).c_str());
+                }
                 return true;
+            }
+            if (line.find("mining.notify") != std::string::npos) {
+                if (!opt.quiet || opt.protocol_debug) {
+                    fprintf(stderr, "invalid mining.notify bytes=%zu; reconnecting\n", line.size());
+                }
+                return false;
             }
 
             uint64_t response_id = 0;
@@ -816,13 +783,6 @@ int main(int argc, char **argv) {
 
             if (line.find("\"id\":1") != std::string::npos &&
                 line.find("\"result\":true") != std::string::npos) {
-                fs.status = "subscribed";
-                write_stats_file(opt, fs);
-                if (!opt.quiet) fprintf(stderr, "pool subscribe ok\n");
-                return true;
-            }
-            if (line.find("\"id\":2") != std::string::npos &&
-                line.find("\"result\":true") != std::string::npos) {
                 fs.status = have_job ? "mining" : "waiting job";
                 write_stats_file(opt, fs);
                 if (!opt.quiet) fprintf(stderr, "pool authorize ok\n");
@@ -839,20 +799,25 @@ int main(int argc, char **argv) {
         auto drain_pool = [&](std::chrono::milliseconds timeout) -> bool {
             std::string line;
             if (stratum_reader.pop(line, timeout)) {
-                process_pool_line(line);
+                if (!process_pool_line(line)) return false;
                 while (stratum_reader.pop(line, std::chrono::milliseconds(0))) {
-                    process_pool_line(line);
+                    if (!process_pool_line(line)) return false;
                 }
             }
             return stratum_reader.is_alive();
         };
 
         while (!g_stop) {
-            if (!drain_pool(have_job ? std::chrono::milliseconds(1) : std::chrono::seconds(10))) break;
+            if (!drain_pool(have_job ? std::chrono::milliseconds(1) : std::chrono::seconds(1))) break;
 
             if (!have_job) {
                 auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration_cast<std::chrono::seconds>(now - connected_at).count() > 15) {
+                if (now - last_job_request >= std::chrono::seconds(5)) {
+                    if (!send_all(fd, auth)) break;
+                    last_job_request = now;
+                    if (opt.protocol_debug) fprintf(stderr, "protocol tx reauthorize bytes=%zu\n", auth.size());
+                }
+                if (now - connected_at >= std::chrono::seconds(30)) {
                     fs.status = "no job reconnect";
                     write_stats_file(opt, fs);
                     if (!opt.quiet) fprintf(stderr, "no mining.notify after handshake; reconnecting\n");
@@ -861,8 +826,9 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            if (!pending_submits.empty() &&
-                std::chrono::steady_clock::now() - pending_submits.front().second >= SHARE_RESPONSE_TIMEOUT) {
+            if (opt.share_response_timeout > 0 && !pending_submits.empty() &&
+                std::chrono::steady_clock::now() - pending_submits.front().second >=
+                    std::chrono::seconds(opt.share_response_timeout)) {
                 fs.pending = pending_submits.size();
                 fs.status = "share reply timeout";
                 write_stats_file(opt, fs);
@@ -871,15 +837,6 @@ int main(int argc, char **argv) {
                         pending_submits.size());
                 }
                 break;
-            }
-
-            if (opt.max_outstanding_shares > 0 &&
-                pending_submits.size() >= opt.max_outstanding_shares) {
-                fs.pending = pending_submits.size();
-                fs.status = "waiting replies";
-                write_stats_file(opt, fs);
-                if (!drain_pool(std::chrono::seconds(1))) break;
-                continue;
             }
 
             h_cand = {};
@@ -946,30 +903,53 @@ int main(int argc, char **argv) {
                 if (!opt.quiet) fprintf(stderr, "candidates=%u first_nonce=%" PRIu64 " first_hash=%s\n",
                     found_count, h_cand.nonce[0], hash_hex(h_cand.hash[0]).c_str());
                 bool submit_ok = true;
-                uint32_t submit_count = found_count;
-                if (submit_count > opt.max_submit_per_batch) submit_count = opt.max_submit_per_batch;
+                std::vector<uint32_t> submit_indices;
+                uint32_t block_candidates = 0;
+
+                // A network-valid block must never be dropped by ordinary share limits.
+                for (uint32_t i = 0; i < found_count; ++i) {
+                    if (protocol_hash_below_target(h_cand.hash[i], network_target)) {
+                        submit_indices.push_back(i);
+                        ++block_candidates;
+                    }
+                }
+
+                uint32_t ordinary_room = opt.max_submit_per_batch;
                 if (opt.max_outstanding_shares > 0) {
                     size_t outstanding = pending_submits.size();
                     if (outstanding >= opt.max_outstanding_shares) {
-                        submit_count = 0;
+                        ordinary_room = 0;
                     } else {
                         uint32_t room = opt.max_outstanding_shares - (uint32_t)outstanding;
-                        if (submit_count > room) submit_count = room;
+                        if (ordinary_room > room) ordinary_room = room;
                     }
                 }
-                if (submit_count == 0) {
-                    fs.pending = pending_submits.size();
-                    fs.status = "waiting replies";
-                    write_stats_file(opt, fs);
-                    if (!drain_pool(std::chrono::seconds(1))) break;
+
+                for (uint32_t i = 0; i < found_count && ordinary_room > 0; ++i) {
+                    if (!protocol_hash_below_target(h_cand.hash[i], network_target)) {
+                        submit_indices.push_back(i);
+                        --ordinary_room;
+                    }
                 }
-                for (uint32_t i = 0; i < submit_count; i++) {
+
+                if (block_candidates > 0) {
+                    fs.status = "block candidate";
+                    write_stats_file(opt, fs);
+                    fprintf(stderr, "BLOCK CANDIDATE count=%u job=%" PRIu64 " (bypassing share limits)\n",
+                        block_candidates, job_id);
+                } else if (submit_indices.empty()) {
+                    fs.pending = pending_submits.size();
+                    fs.status = "shares throttled";
+                    write_stats_file(opt, fs);
+                }
+
+                for (uint32_t candidate_index : submit_indices) {
                     char buf[512];
                     uint64_t submit_id = next_submit_id++;
-                    std::string final_hash = hash_hex(h_cand.hash[i]);
+                    std::string final_hash = hash_hex(h_cand.hash[candidate_index]);
                     snprintf(buf, sizeof(buf),
                         "{\"id\":%" PRIu64 ",\"method\":\"mining.submit\",\"params\":[\"%s\",%" PRIu64 ",%" PRIu64 ",\"%s\"]}\n",
-                        submit_id, opt.address.c_str(), job_id, h_cand.nonce[i], final_hash.c_str());
+                        submit_id, opt.address.c_str(), job_id, h_cand.nonce[candidate_index], final_hash.c_str());
                     submitted++;
                     pending_submits.emplace_back(submit_id, std::chrono::steady_clock::now());
                     fs.submitted = submitted;
@@ -979,9 +959,16 @@ int main(int argc, char **argv) {
                         submit_ok = false;
                         break;
                     }
+                    if (opt.protocol_debug) {
+                        fprintf(stderr, "protocol tx submit id=%" PRIu64 " job=%" PRIu64
+                            " nonce=%" PRIu64 " block=%s pending=%zu\n",
+                            submit_id, job_id, h_cand.nonce[candidate_index],
+                            protocol_hash_below_target(h_cand.hash[candidate_index], network_target) ? "yes" : "no",
+                            pending_submits.size());
+                    }
                 }
                 if (!submit_ok) break;
-                if (!drain_pool(std::chrono::seconds(2))) break;
+                if (!drain_pool(std::chrono::milliseconds(0))) break;
             }
             base += opt.batch * (uint64_t)opt.lane_count;
         }
