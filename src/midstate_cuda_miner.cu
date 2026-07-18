@@ -27,10 +27,12 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_signal_count = 0;
+static constexpr const char *APP_VERSION = "v0.1.7";
 static constexpr uint32_t MAX_CANDIDATES = 512;
 
 static void on_sigint(int) {
@@ -239,6 +241,7 @@ static bool parse_args(int argc, char **argv, Options &o, uint32_t &iters) {
         else if (a == "--no-dashboard") o.dashboard = false;
         else if (a == "--quiet") o.quiet = true;
         else if (a == "--child") o.child = true;
+        else if (a == "--version") { printf("midstate-cuda-miner %s\n", APP_VERSION); exit(0); }
         else if (a == "-h" || a == "--help") { usage(argv[0]); exit(0); }
         else { fprintf(stderr, "unknown option: %s\n", a.c_str()); return false; }
     }
@@ -381,7 +384,7 @@ static void render_dashboard(
 
     std::ostringstream out;
     out << "\033[H\033[2J";
-    out << "midstate-cuda-miner - NVIDIA CUDA Stratum miner\n";
+    out << "midstate-cuda-miner " << APP_VERSION << " - NVIDIA CUDA Stratum miner\n";
     out << "Pool: " << opt.pool << "    Address: " << short_text(opt.address, 24)
         << "    Worker: " << opt.worker << "\n";
     out << "Uptime: " << format_elapsed(elapsed)
@@ -524,12 +527,16 @@ static bool parse_notify(const std::string &line, uint64_t &job_id, uint8_t mids
     return hex_to_32(m[2].str(), midstate);
 }
 
-static bool is_accepted(const std::string &line) {
-    return line.find("\"id\":2") != std::string::npos && line.find("\"result\":true") != std::string::npos;
-}
-
-static bool is_rejected(const std::string &line) {
-    return line.find("\"id\":2") != std::string::npos && line.find("\"result\":false") != std::string::npos;
+static bool parse_submit_response(const std::string &line, uint64_t &id, bool &accepted) {
+    std::regex id_re("\"id\"\\s*:\\s*([0-9]+)");
+    std::regex result_re("\"result\"\\s*:\\s*(true|false)");
+    std::smatch id_m;
+    std::smatch result_m;
+    if (!std::regex_search(line, id_m, id_re)) return false;
+    if (!std::regex_search(line, result_m, result_re)) return false;
+    id = strtoull(id_m[1].str().c_str(), nullptr, 10);
+    accepted = result_m[1].str() == "true";
+    return true;
 }
 
 static bool has_non_null_error(const std::string &line) {
@@ -690,12 +697,13 @@ int main(int argc, char **argv) {
     uint8_t job_midstate[32] = {0};
     bool have_job = false;
     uint64_t accepted = 0, rejected = 0, checked = 0, total_hashes = 0, submitted = 0, candidates = 0;
+    uint64_t next_submit_id = 1000;
     double current_hps = 0.0;
     auto t0 = std::chrono::steady_clock::now();
     auto started = t0;
     auto last_share = started;
     bool has_share = false;
-    std::deque<std::chrono::steady_clock::time_point> pending_submits;
+    std::deque<std::pair<uint64_t, std::chrono::steady_clock::time_point>> pending_submits;
     FileStats fs;
     fs.gpu = opt.device;
     fs.name = prop.name;
@@ -720,66 +728,103 @@ int main(int argc, char **argv) {
         if (!opt.quiet) fprintf(stderr, "connected to %s:%s\n", host.c_str(), port.c_str());
 
         std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n";
-        std::string auth = "{\"id\":1,\"method\":\"mining.authorize\",\"params\":[\"" +
+        std::string auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" +
             opt.address + "\",\"" + opt.worker + "\"]}\n";
         send_all(fd, sub);
         send_all(fd, auth);
         auto connected_at = std::chrono::steady_clock::now();
 
-        while (!g_stop) {
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(fd, &rfds);
-            struct timeval tv;
-            tv.tv_sec = have_job ? 0 : 10;
-            tv.tv_usec = have_job ? 1000 : 0;
-            int sr = select(fd + 1, &rfds, nullptr, nullptr, &tv);
-            if (sr < 0 && errno != EINTR) break;
-            if (sr > 0 && FD_ISSET(fd, &rfds)) {
-                std::string line;
-                if (!read_line(fd, line)) break;
-                uint64_t jid;
-                uint8_t ms[32];
-                if (parse_notify(line, jid, ms)) {
-                    job_id = jid;
-                    memcpy(job_midstate, ms, 32);
-                    CUDA_CHECK(cudaMemcpy(d_midstate, job_midstate, 32, cudaMemcpyHostToDevice));
-                    have_job = true;
-                    fs.job = std::to_string(job_id);
-                    fs.status = "mining";
-                    write_stats_file(opt, fs);
-                    if (!opt.quiet) fprintf(stderr, "new job %" PRIu64 " midstate=%s\n", job_id, hash_hex(job_midstate).c_str());
-                } else if (line.find("\"id\":1") != std::string::npos &&
-                           line.find("\"result\":true") != std::string::npos) {
-                    fs.status = "handshake ok";
-                    write_stats_file(opt, fs);
-                    if (!opt.quiet) fprintf(stderr, "pool handshake ok\n");
-                } else if (is_accepted(line)) {
-                    if (!pending_submits.empty()) {
-                        fs.latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - pending_submits.front()).count();
-                        pending_submits.pop_front();
+        auto process_pool_line = [&](const std::string &line) -> bool {
+            uint64_t jid;
+            uint8_t ms[32];
+            if (parse_notify(line, jid, ms)) {
+                job_id = jid;
+                memcpy(job_midstate, ms, 32);
+                CUDA_CHECK(cudaMemcpy(d_midstate, job_midstate, 32, cudaMemcpyHostToDevice));
+                have_job = true;
+                fs.job = std::to_string(job_id);
+                fs.status = "mining";
+                write_stats_file(opt, fs);
+                if (!opt.quiet) fprintf(stderr, "new job %" PRIu64 " midstate=%s\n", job_id, hash_hex(job_midstate).c_str());
+                return true;
+            }
+
+            uint64_t response_id = 0;
+            bool response_accepted = false;
+            if (parse_submit_response(line, response_id, response_accepted) && response_id >= 1000) {
+                auto now = std::chrono::steady_clock::now();
+                for (auto it = pending_submits.begin(); it != pending_submits.end(); ++it) {
+                    if (it->first == response_id) {
+                        fs.latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count();
+                        pending_submits.erase(it);
+                        break;
                     }
+                }
+                if (response_accepted) {
                     accepted++;
                     has_share = true;
-                    last_share = std::chrono::steady_clock::now();
+                    last_share = now;
                     fs.accepted = accepted;
                     fs.status = "share accepted";
                     write_stats_file(opt, fs);
                     if (!opt.quiet) fprintf(stderr, "share accepted (%" PRIu64 " acc / %" PRIu64 " rej)\n", accepted, rejected);
-                } else if (is_rejected(line) || has_non_null_error(line)) {
-                    if (!pending_submits.empty()) {
-                        fs.latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - pending_submits.front()).count();
-                        pending_submits.pop_front();
-                    }
+                } else {
                     rejected++;
                     fs.rejected = rejected;
                     fs.status = "share rejected";
                     write_stats_file(opt, fs);
                     if (!opt.quiet) fprintf(stderr, "share rejected: %s\n", line.c_str());
                 }
+                return true;
             }
+
+            if (line.find("\"id\":1") != std::string::npos &&
+                line.find("\"result\":true") != std::string::npos) {
+                fs.status = "subscribed";
+                write_stats_file(opt, fs);
+                if (!opt.quiet) fprintf(stderr, "pool subscribe ok\n");
+                return true;
+            }
+            if (line.find("\"id\":2") != std::string::npos &&
+                line.find("\"result\":true") != std::string::npos) {
+                fs.status = "handshake ok";
+                write_stats_file(opt, fs);
+                if (!opt.quiet) fprintf(stderr, "pool authorize ok\n");
+                return true;
+            }
+            if (has_non_null_error(line)) {
+                fs.status = "pool error";
+                write_stats_file(opt, fs);
+                if (!opt.quiet) fprintf(stderr, "pool error: %s\n", line.c_str());
+            }
+            return true;
+        };
+
+        auto drain_pool = [&](long sec, long usec) -> bool {
+            while (!g_stop) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(fd, &rfds);
+                struct timeval tv;
+                tv.tv_sec = sec;
+                tv.tv_usec = usec;
+                int sr = select(fd + 1, &rfds, nullptr, nullptr, &tv);
+                if (sr < 0) {
+                    if (errno == EINTR) return true;
+                    return false;
+                }
+                if (sr == 0 || !FD_ISSET(fd, &rfds)) return true;
+                std::string line;
+                if (!read_line(fd, line)) return false;
+                process_pool_line(line);
+                sec = 0;
+                usec = 0;
+            }
+            return true;
+        };
+
+        while (!g_stop) {
+            if (!drain_pool(have_job ? 0 : 10, have_job ? 1000 : 0)) break;
 
             if (!have_job) {
                 auto now = std::chrono::steady_clock::now();
@@ -843,11 +888,12 @@ int main(int argc, char **argv) {
                 bool submit_ok = true;
                 for (uint32_t i = 0; i < found_count; i++) {
                     char buf[512];
+                    uint64_t submit_id = next_submit_id++;
                     snprintf(buf, sizeof(buf),
-                        "{\"id\":2,\"method\":\"mining.submit\",\"params\":[\"%s\",%" PRIu64 ",%" PRIu64 "]}\n",
-                        opt.address.c_str(), job_id, h_cand.nonce[i]);
+                        "{\"id\":%" PRIu64 ",\"method\":\"mining.submit\",\"params\":[\"%s\",%" PRIu64 ",%" PRIu64 "]}\n",
+                        submit_id, opt.address.c_str(), job_id, h_cand.nonce[i]);
                     submitted++;
-                    pending_submits.push_back(std::chrono::steady_clock::now());
+                    pending_submits.emplace_back(submit_id, std::chrono::steady_clock::now());
                     fs.submitted = submitted;
                     write_stats_file(opt, fs);
                     if (!send_all(fd, buf)) {
@@ -856,6 +902,7 @@ int main(int argc, char **argv) {
                     }
                 }
                 if (!submit_ok) break;
+                if (!drain_pool(0, 0)) break;
             }
             base += opt.batch * (uint64_t)opt.lane_count;
         }
