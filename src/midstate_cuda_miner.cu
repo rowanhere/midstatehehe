@@ -316,6 +316,13 @@ static bool is_rejected(const std::string &line) {
     return line.find("\"id\":2") != std::string::npos && line.find("\"result\":false") != std::string::npos;
 }
 
+static bool has_non_null_error(const std::string &line) {
+    std::regex re("\"error\"\\s*:\\s*(null|\"[^\"]*\"|\\[[^\\]]*\\]|\\{[^\\}]*\\})");
+    std::smatch m;
+    if (!std::regex_search(line, m, re)) return false;
+    return m[1].str() != "null";
+}
+
 int main(int argc, char **argv) {
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
@@ -438,10 +445,13 @@ int main(int argc, char **argv) {
                     CUDA_CHECK(cudaMemcpy(d_midstate, job_midstate, 32, cudaMemcpyHostToDevice));
                     have_job = true;
                     fprintf(stderr, "new job %" PRIu64 " midstate=%s\n", job_id, hash_hex(job_midstate).c_str());
+                } else if (line.find("\"id\":1") != std::string::npos &&
+                           line.find("\"result\":true") != std::string::npos) {
+                    fprintf(stderr, "pool handshake ok\n");
                 } else if (is_accepted(line)) {
                     accepted++;
                     fprintf(stderr, "share accepted (%" PRIu64 " acc / %" PRIu64 " rej)\n", accepted, rejected);
-                } else if (is_rejected(line) || line.find("\"error\"") != std::string::npos) {
+                } else if (is_rejected(line) || has_non_null_error(line)) {
                     rejected++;
                     fprintf(stderr, "share rejected: %s\n", line.c_str());
                 }
