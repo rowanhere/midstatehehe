@@ -54,6 +54,9 @@ accepted/rejected shares, submitted candidates, pool latency in the header,
 active job, and per-GPU status.
 The CUDA kernel returns multiple candidates per batch, so easy share targets do
 not waste valid shares that occur after the first hit in a launch.
+By default the miner submits only one share per GPU batch so the Midstate pool's
+expensive share validation does not get flooded; raise `--max-submit-per-batch`
+only after accepted/rejected responses are keeping up.
 Ctrl+C asks all GPU workers to stop and force-kills any worker that remains
 inside a long CUDA launch for more than a couple seconds.
 
@@ -90,6 +93,7 @@ Defaults are conservative for Pascal:
 --blocks 4096
 --threads 128
 --batch 524288
+--max-submit-per-batch 1
 ```
 
 Try:
@@ -97,6 +101,7 @@ Try:
 ```bash
 ./midstate-cuda-miner -o stratum+tcp://127.0.0.1:3333 -a <MSS> -w test --blocks 8192 --threads 128
 ./midstate-cuda-miner -o stratum+tcp://127.0.0.1:3333 -a <MSS> -w test --blocks 8192 --threads 256
+./midstate-cuda-miner -o stratum+tcp://127.0.0.1:3333 -a <MSS> -w test --max-submit-per-batch 2
 ```
 
 Higher hashrate is good only if accepted shares also increase.

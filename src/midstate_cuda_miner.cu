@@ -33,7 +33,7 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_signal_count = 0;
-static constexpr const char *APP_VERSION = "v0.1.8";
+static constexpr const char *APP_VERSION = "v0.1.9";
 static constexpr uint32_t MAX_CANDIDATES = 512;
 
 static void on_sigint(int) {
@@ -69,6 +69,7 @@ struct Options {
     uint64_t seed = 0;
     int lane_index = 0;
     int lane_count = 1;
+    uint32_t max_submit_per_batch = 1;
     bool dashboard = true;
     bool quiet = false;
     bool child = false;
@@ -211,6 +212,7 @@ static void usage(const char *argv0) {
     fprintf(stderr,
         "Usage: %s -o stratum+tcp://host:port -a ADDRESS [-w worker] [-d device]\n"
         "          [--blocks N] [--threads N] [--batch N] [--iters N]\n"
+        "          [--max-submit-per-batch N]\n"
         "          [--no-dashboard]\n\n"
         "Defaults: all GPUs, --blocks 4096 --threads 128 --batch 524288 --iters 1000000\n",
         argv0);
@@ -238,6 +240,7 @@ static bool parse_args(int argc, char **argv, Options &o, uint32_t &iters) {
         else if (a == "--seed") o.seed = strtoull(need(a.c_str()), nullptr, 10);
         else if (a == "--lane-index") o.lane_index = atoi(need(a.c_str()));
         else if (a == "--lane-count") o.lane_count = atoi(need(a.c_str()));
+        else if (a == "--max-submit-per-batch") o.max_submit_per_batch = (uint32_t)strtoul(need(a.c_str()), nullptr, 10);
         else if (a == "--stats-dir") o.stats_dir = need(a.c_str());
         else if (a == "--no-dashboard") o.dashboard = false;
         else if (a == "--quiet") o.quiet = true;
@@ -923,7 +926,9 @@ int main(int argc, char **argv) {
                 if (!opt.quiet) fprintf(stderr, "candidates=%u first_nonce=%" PRIu64 " first_hash=%s\n",
                     found_count, h_cand.nonce[0], hash_hex(h_cand.hash[0]).c_str());
                 bool submit_ok = true;
-                for (uint32_t i = 0; i < found_count; i++) {
+                uint32_t submit_count = found_count;
+                if (submit_count > opt.max_submit_per_batch) submit_count = opt.max_submit_per_batch;
+                for (uint32_t i = 0; i < submit_count; i++) {
                     char buf[512];
                     uint64_t submit_id = next_submit_id++;
                     snprintf(buf, sizeof(buf),
