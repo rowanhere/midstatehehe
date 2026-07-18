@@ -1,0 +1,5 @@
+midstate-cuda-miner
+*.o
+*.tar.gz
+SHA256SUMS.txt
+dist/
