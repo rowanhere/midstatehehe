@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -29,10 +30,21 @@
 #include <vector>
 
 static volatile sig_atomic_t g_stop = 0;
+static volatile sig_atomic_t g_signal_count = 0;
 static constexpr uint32_t MAX_CANDIDATES = 512;
 
 static void on_sigint(int) {
     g_stop = 1;
+    g_signal_count++;
+}
+
+static void install_signal_handlers() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_sigint;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 }
 
 #define CUDA_CHECK(x) do { \
@@ -273,6 +285,8 @@ struct FileStats {
     uint64_t rejected = 0;
     uint64_t candidates = 0;
     uint64_t last_share_age = 0;
+    int64_t latency_ms = -1;
+    int64_t connect_ms = -1;
 };
 
 static std::string stats_path(const std::string &dir, int gpu) {
@@ -298,6 +312,8 @@ static void write_stats_file(const Options &opt, const FileStats &s) {
     out << "rejected=" << s.rejected << "\n";
     out << "candidates=" << s.candidates << "\n";
     out << "last_share_age=" << s.last_share_age << "\n";
+    out << "latency_ms=" << s.latency_ms << "\n";
+    out << "connect_ms=" << s.connect_ms << "\n";
     out.close();
     rename(tmp.c_str(), path.c_str());
 }
@@ -324,8 +340,15 @@ static FileStats read_stats_file(const std::string &path) {
         else if (k == "rejected") s.rejected = strtoull(v.c_str(), nullptr, 10);
         else if (k == "candidates") s.candidates = strtoull(v.c_str(), nullptr, 10);
         else if (k == "last_share_age") s.last_share_age = strtoull(v.c_str(), nullptr, 10);
+        else if (k == "latency_ms") s.latency_ms = strtoll(v.c_str(), nullptr, 10);
+        else if (k == "connect_ms") s.connect_ms = strtoll(v.c_str(), nullptr, 10);
     }
     return s;
+}
+
+static std::string format_ms(int64_t ms) {
+    if (ms < 0) return "-";
+    return std::to_string(ms) + " ms";
 }
 
 static void render_dashboard(
@@ -377,9 +400,11 @@ static void render_dashboard(
         << std::setw(15) << "Average"
         << std::setw(10) << "Acc/Rej"
         << std::setw(11) << "Submitted"
+        << std::setw(11) << "Latency"
+        << std::setw(10) << "Connect"
         << std::setw(12) << "Job"
         << "Status\n";
-    out << std::string(103, '-') << "\n";
+    out << std::string(124, '-') << "\n";
 
     for (const auto &s : snap) {
         std::string accrej = std::to_string(s.accepted) + "/" + std::to_string(s.rejected);
@@ -390,6 +415,8 @@ static void render_dashboard(
             << std::setw(15) << format_hashrate(s.avg_hps)
             << std::setw(10) << accrej
             << std::setw(11) << s.submitted
+            << std::setw(11) << format_ms(s.latency_ms)
+            << std::setw(10) << format_ms(s.connect_ms)
             << std::setw(12) << short_text(s.job, 11)
             << short_text(s.status, 24) << "\n";
     }
@@ -408,7 +435,8 @@ static bool parse_pool_url(const std::string &url, std::string &host, std::strin
     return !host.empty() && !port.empty();
 }
 
-static int connect_tcp(const std::string &host, const std::string &port) {
+static int connect_tcp(const std::string &host, const std::string &port, int64_t *connect_ms = nullptr) {
+    auto start = std::chrono::steady_clock::now();
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -428,6 +456,10 @@ static int connect_tcp(const std::string &host, const std::string &port) {
         fd = -1;
     }
     freeaddrinfo(res);
+    if (connect_ms && fd >= 0) {
+        auto end = std::chrono::steady_clock::now();
+        *connect_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    }
     return fd;
 }
 
@@ -508,8 +540,7 @@ static bool has_non_null_error(const std::string &line) {
 }
 
 int main(int argc, char **argv) {
-    signal(SIGINT, on_sigint);
-    signal(SIGTERM, on_sigint);
+    install_signal_handlers();
 
     Options opt;
     uint32_t iterations;
@@ -577,13 +608,22 @@ int main(int argc, char **argv) {
         }
 
         int rc = 0;
+        bool stopping_children = false;
+        auto stop_started = std::chrono::steady_clock::now();
         if (opt.dashboard) {
             std::cout << "\033[?1049h\033[?25l" << std::flush;
         }
         while (!children.empty()) {
             if (g_stop) {
+                if (!stopping_children) {
+                    stopping_children = true;
+                    stop_started = std::chrono::steady_clock::now();
+                }
+                auto now = std::chrono::steady_clock::now();
+                bool hard_kill = g_signal_count > 1 ||
+                    std::chrono::duration_cast<std::chrono::seconds>(now - stop_started).count() >= 2;
                 for (pid_t pid : children) {
-                    kill(pid, SIGTERM);
+                    kill(pid, hard_kill ? SIGKILL : SIGTERM);
                 }
             }
 
@@ -655,6 +695,7 @@ int main(int argc, char **argv) {
     auto started = t0;
     auto last_share = started;
     bool has_share = false;
+    std::deque<std::chrono::steady_clock::time_point> pending_submits;
     FileStats fs;
     fs.gpu = opt.device;
     fs.name = prop.name;
@@ -663,7 +704,8 @@ int main(int argc, char **argv) {
     write_stats_file(opt, fs);
 
     while (!g_stop) {
-        int fd = connect_tcp(host, port);
+        int64_t connect_ms = -1;
+        int fd = connect_tcp(host, port, &connect_ms);
         if (fd < 0) {
             fs.status = "connect failed";
             write_stats_file(opt, fs);
@@ -671,7 +713,9 @@ int main(int argc, char **argv) {
             std::this_thread::sleep_for(std::chrono::seconds(5));
             continue;
         }
+        pending_submits.clear();
         fs.status = "connected";
+        fs.connect_ms = connect_ms;
         write_stats_file(opt, fs);
         if (!opt.quiet) fprintf(stderr, "connected to %s:%s\n", host.c_str(), port.c_str());
 
@@ -711,6 +755,11 @@ int main(int argc, char **argv) {
                     write_stats_file(opt, fs);
                     if (!opt.quiet) fprintf(stderr, "pool handshake ok\n");
                 } else if (is_accepted(line)) {
+                    if (!pending_submits.empty()) {
+                        fs.latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - pending_submits.front()).count();
+                        pending_submits.pop_front();
+                    }
                     accepted++;
                     has_share = true;
                     last_share = std::chrono::steady_clock::now();
@@ -719,6 +768,11 @@ int main(int argc, char **argv) {
                     write_stats_file(opt, fs);
                     if (!opt.quiet) fprintf(stderr, "share accepted (%" PRIu64 " acc / %" PRIu64 " rej)\n", accepted, rejected);
                 } else if (is_rejected(line) || has_non_null_error(line)) {
+                    if (!pending_submits.empty()) {
+                        fs.latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - pending_submits.front()).count();
+                        pending_submits.pop_front();
+                    }
                     rejected++;
                     fs.rejected = rejected;
                     fs.status = "share rejected";
@@ -793,6 +847,7 @@ int main(int argc, char **argv) {
                         "{\"id\":2,\"method\":\"mining.submit\",\"params\":[\"%s\",%" PRIu64 ",%" PRIu64 "]}\n",
                         opt.address.c_str(), job_id, h_cand.nonce[i]);
                     submitted++;
+                    pending_submits.push_back(std::chrono::steady_clock::now());
                     fs.submitted = submitted;
                     write_stats_file(opt, fs);
                     if (!send_all(fd, buf)) {
