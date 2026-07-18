@@ -67,6 +67,9 @@ Workers keep draining Stratum replies while CUDA kernels are running, so accepte
 share responses do not wait behind long GPU batches.
 Buffered Stratum replies are fully drained before waiting on the socket again,
 which prevents pending shares from freezing after a burst of accepted responses.
+Each GPU has a dedicated Stratum reader thread, so CUDA batch control cannot
+starve socket reads. If the pool leaves a submitted share unanswered for 15
+seconds, that worker reconnects instead of remaining stuck at its pending cap.
 Ctrl+C asks all GPU workers to stop and force-kills any worker that remains
 inside a long CUDA launch for more than a couple seconds.
 

@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,10 +32,13 @@
 #include <utility>
 #include <vector>
 
+#include "stratum_reader.hpp"
+
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_signal_count = 0;
-static constexpr const char *APP_VERSION = "v0.1.15";
+static constexpr const char *APP_VERSION = "v0.1.16";
 static constexpr uint32_t MAX_CANDIDATES = 512;
+static constexpr auto SHARE_RESPONSE_TIMEOUT = std::chrono::seconds(15);
 
 static void on_sigint(int) {
     g_stop = 1;
@@ -483,6 +487,11 @@ static int connect_tcp(const std::string &host, const std::string &port, int64_t
         fd = -1;
     }
     freeaddrinfo(res);
+    if (fd >= 0) {
+        int enabled = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
+    }
     if (connect_ms && fd >= 0) {
         auto end = std::chrono::steady_clock::now();
         *connect_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
@@ -501,37 +510,6 @@ static bool send_all(int fd, const std::string &s) {
     }
     return true;
 }
-
-struct LineReader {
-    int fd;
-    std::string buf;
-
-    explicit LineReader(int socket_fd) : fd(socket_fd) {
-        buf.reserve(65536);
-    }
-
-    bool has_buffered_line() const {
-        return buf.find('\n') != std::string::npos;
-    }
-
-    bool read_line(std::string &line) {
-        line.clear();
-        while (true) {
-            size_t nl = buf.find('\n');
-            if (nl != std::string::npos) {
-                line = buf.substr(0, nl);
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                buf.erase(0, nl + 1);
-                return true;
-            }
-
-            char tmp[8192];
-            ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
-            if (n <= 0) return false;
-            buf.append(tmp, (size_t)n);
-        }
-    }
-};
 
 static int hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -782,7 +760,7 @@ int main(int argc, char **argv) {
         fs.connect_ms = connect_ms;
         write_stats_file(opt, fs);
         if (!opt.quiet) fprintf(stderr, "connected to %s:%s\n", host.c_str(), port.c_str());
-        LineReader line_reader(fd);
+        StratumReader stratum_reader(fd);
 
         std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n";
         std::string auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" +
@@ -858,33 +836,19 @@ int main(int argc, char **argv) {
             return true;
         };
 
-        auto drain_pool = [&](long sec, long usec) -> bool {
-            while (!g_stop) {
-                if (!line_reader.has_buffered_line()) {
-                    fd_set rfds;
-                    FD_ZERO(&rfds);
-                    FD_SET(fd, &rfds);
-                    struct timeval tv;
-                    tv.tv_sec = sec;
-                    tv.tv_usec = usec;
-                    int sr = select(fd + 1, &rfds, nullptr, nullptr, &tv);
-                    if (sr < 0) {
-                        if (errno == EINTR) return true;
-                        return false;
-                    }
-                    if (sr == 0 || !FD_ISSET(fd, &rfds)) return true;
-                }
-                std::string line;
-                if (!line_reader.read_line(line)) return false;
+        auto drain_pool = [&](std::chrono::milliseconds timeout) -> bool {
+            std::string line;
+            if (stratum_reader.pop(line, timeout)) {
                 process_pool_line(line);
-                sec = 0;
-                usec = 0;
+                while (stratum_reader.pop(line, std::chrono::milliseconds(0))) {
+                    process_pool_line(line);
+                }
             }
-            return true;
+            return stratum_reader.is_alive();
         };
 
         while (!g_stop) {
-            if (!drain_pool(have_job ? 0 : 10, have_job ? 1000 : 0)) break;
+            if (!drain_pool(have_job ? std::chrono::milliseconds(1) : std::chrono::seconds(10))) break;
 
             if (!have_job) {
                 auto now = std::chrono::steady_clock::now();
@@ -897,12 +861,24 @@ int main(int argc, char **argv) {
                 continue;
             }
 
+            if (!pending_submits.empty() &&
+                std::chrono::steady_clock::now() - pending_submits.front().second >= SHARE_RESPONSE_TIMEOUT) {
+                fs.pending = pending_submits.size();
+                fs.status = "share reply timeout";
+                write_stats_file(opt, fs);
+                if (!opt.quiet) {
+                    fprintf(stderr, "oldest share reply timed out with %zu pending; reconnecting\n",
+                        pending_submits.size());
+                }
+                break;
+            }
+
             if (opt.max_outstanding_shares > 0 &&
                 pending_submits.size() >= opt.max_outstanding_shares) {
                 fs.pending = pending_submits.size();
                 fs.status = "waiting replies";
                 write_stats_file(opt, fs);
-                if (!drain_pool(1, 0)) break;
+                if (!drain_pool(std::chrono::seconds(1))) break;
                 continue;
             }
 
@@ -917,7 +893,7 @@ int main(int argc, char **argv) {
                 cudaError_t q = cudaEventQuery(kernel_done);
                 if (q == cudaSuccess) break;
                 if (q != cudaErrorNotReady) CUDA_CHECK(q);
-                if (!drain_pool(0, 1000)) {
+                if (!drain_pool(std::chrono::milliseconds(1))) {
                     connection_ok = false;
                     break;
                 }
@@ -985,7 +961,7 @@ int main(int argc, char **argv) {
                     fs.pending = pending_submits.size();
                     fs.status = "waiting replies";
                     write_stats_file(opt, fs);
-                    if (!drain_pool(1, 0)) break;
+                    if (!drain_pool(std::chrono::seconds(1))) break;
                 }
                 for (uint32_t i = 0; i < submit_count; i++) {
                     char buf[512];
@@ -1005,10 +981,11 @@ int main(int argc, char **argv) {
                     }
                 }
                 if (!submit_ok) break;
-                if (!drain_pool(2, 0)) break;
+                if (!drain_pool(std::chrono::seconds(2))) break;
             }
             base += opt.batch * (uint64_t)opt.lane_count;
         }
+        stratum_reader.stop();
         close(fd);
         have_job = false;
         fs.status = "disconnected";

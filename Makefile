@@ -17,12 +17,16 @@ LDFLAGS ?= -cudart=static
 
 TARGET := midstate-cuda-miner
 
-.PHONY: all clean
+.PHONY: all clean test
 
 all: $(TARGET)
 
-$(TARGET): src/midstate_cuda_miner.cu
+$(TARGET): src/midstate_cuda_miner.cu src/stratum_reader.hpp
 	$(NVCC) $(NVCCFLAGS) $(GENCODE) -std=c++17 -o $@ $< $(LDFLAGS)
 
+test: tests/stratum_reader_test.cpp src/stratum_reader.hpp
+	$(CXX) -O2 -std=c++17 -pthread -o stratum-reader-test tests/stratum_reader_test.cpp
+	./stratum-reader-test
+
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) stratum-reader-test
