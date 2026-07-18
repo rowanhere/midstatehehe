@@ -33,7 +33,7 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_signal_count = 0;
-static constexpr const char *APP_VERSION = "v0.1.11";
+static constexpr const char *APP_VERSION = "v0.1.12";
 static constexpr uint32_t MAX_CANDIDATES = 512;
 
 static void on_sigint(int) {
@@ -70,6 +70,7 @@ struct Options {
     int lane_index = 0;
     int lane_count = 1;
     uint32_t max_submit_per_batch = 1;
+    uint32_t max_outstanding_shares = 8;
     bool dashboard = true;
     bool quiet = false;
     bool child = false;
@@ -212,9 +213,10 @@ static void usage(const char *argv0) {
     fprintf(stderr,
         "Usage: %s -o stratum+tcp://host:port -a ADDRESS [-w worker] [-d device]\n"
         "          [--blocks N] [--threads N] [--batch N] [--iters N]\n"
-        "          [--max-submit-per-batch N]\n"
+        "          [--max-submit-per-batch N] [--max-outstanding-shares N]\n"
         "          [--no-dashboard]\n\n"
-        "Defaults: all GPUs, --blocks 4096 --threads 128 --batch 524288 --iters 1000000\n",
+        "Defaults: all GPUs, --blocks 4096 --threads 128 --batch 524288 --iters 1000000\n"
+        "          --max-submit-per-batch 1 --max-outstanding-shares 8\n",
         argv0);
 }
 
@@ -241,6 +243,7 @@ static bool parse_args(int argc, char **argv, Options &o, uint32_t &iters) {
         else if (a == "--lane-index") o.lane_index = atoi(need(a.c_str()));
         else if (a == "--lane-count") o.lane_count = atoi(need(a.c_str()));
         else if (a == "--max-submit-per-batch") o.max_submit_per_batch = (uint32_t)strtoul(need(a.c_str()), nullptr, 10);
+        else if (a == "--max-outstanding-shares") o.max_outstanding_shares = (uint32_t)strtoul(need(a.c_str()), nullptr, 10);
         else if (a == "--stats-dir") o.stats_dir = need(a.c_str());
         else if (a == "--no-dashboard") o.dashboard = false;
         else if (a == "--quiet") o.quiet = true;
@@ -288,6 +291,7 @@ struct FileStats {
     double avg_hps = 0.0;
     uint64_t total = 0;
     uint64_t submitted = 0;
+    uint64_t pending = 0;
     uint64_t accepted = 0;
     uint64_t rejected = 0;
     uint64_t candidates = 0;
@@ -315,6 +319,7 @@ static void write_stats_file(const Options &opt, const FileStats &s) {
     out << "avg_hps=" << std::fixed << std::setprecision(3) << s.avg_hps << "\n";
     out << "total=" << s.total << "\n";
     out << "submitted=" << s.submitted << "\n";
+    out << "pending=" << s.pending << "\n";
     out << "accepted=" << s.accepted << "\n";
     out << "rejected=" << s.rejected << "\n";
     out << "candidates=" << s.candidates << "\n";
@@ -343,6 +348,7 @@ static FileStats read_stats_file(const std::string &path) {
         else if (k == "avg_hps") s.avg_hps = atof(v.c_str());
         else if (k == "total") s.total = strtoull(v.c_str(), nullptr, 10);
         else if (k == "submitted") s.submitted = strtoull(v.c_str(), nullptr, 10);
+        else if (k == "pending") s.pending = strtoull(v.c_str(), nullptr, 10);
         else if (k == "accepted") s.accepted = strtoull(v.c_str(), nullptr, 10);
         else if (k == "rejected") s.rejected = strtoull(v.c_str(), nullptr, 10);
         else if (k == "candidates") s.candidates = strtoull(v.c_str(), nullptr, 10);
@@ -372,13 +378,14 @@ static void render_dashboard(
     }
 
     double total_hps = 0.0;
-    uint64_t total_hashes = 0, submitted = 0, accepted = 0, rejected = 0, candidates = 0;
+    uint64_t total_hashes = 0, submitted = 0, pending = 0, accepted = 0, rejected = 0, candidates = 0;
     int64_t latency_sum = 0, connect_sum = 0;
     int latency_count = 0, connect_count = 0;
     for (const auto &s : snap) {
         total_hps += s.hps;
         total_hashes += s.total;
         submitted += s.submitted;
+        pending += s.pending;
         accepted += s.accepted;
         rejected += s.rejected;
         candidates += s.candidates;
@@ -412,6 +419,7 @@ static void render_dashboard(
     out << "Shares: accepted " << accepted
         << " | rejected " << rejected
         << " | submitted " << submitted
+        << " | pending " << pending
         << " | candidates " << candidates << "\n\n";
 
     out << std::left
@@ -421,9 +429,10 @@ static void render_dashboard(
         << std::setw(15) << "Average"
         << std::setw(10) << "Acc/Rej"
         << std::setw(11) << "Submitted"
+        << std::setw(9) << "Pending"
         << std::setw(12) << "Job"
         << "Status\n";
-    out << std::string(103, '-') << "\n";
+    out << std::string(112, '-') << "\n";
 
     for (const auto &s : snap) {
         std::string accrej = std::to_string(s.accepted) + "/" + std::to_string(s.rejected);
@@ -434,6 +443,7 @@ static void render_dashboard(
             << std::setw(15) << format_hashrate(s.avg_hps)
             << std::setw(10) << accrej
             << std::setw(11) << s.submitted
+            << std::setw(9) << s.pending
             << std::setw(12) << short_text(s.job, 11)
             << short_text(s.status, 24) << "\n";
     }
@@ -761,6 +771,7 @@ int main(int argc, char **argv) {
             continue;
         }
         pending_submits.clear();
+        fs.pending = 0;
         fs.status = "connected";
         fs.connect_ms = connect_ms;
         write_stats_file(opt, fs);
@@ -797,6 +808,7 @@ int main(int argc, char **argv) {
                     if (it->first == response_id) {
                         fs.latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second).count();
                         pending_submits.erase(it);
+                        fs.pending = pending_submits.size();
                         break;
                     }
                 }
@@ -877,6 +889,15 @@ int main(int argc, char **argv) {
                 continue;
             }
 
+            if (opt.max_outstanding_shares > 0 &&
+                pending_submits.size() >= opt.max_outstanding_shares) {
+                fs.pending = pending_submits.size();
+                fs.status = "waiting replies";
+                write_stats_file(opt, fs);
+                if (!drain_pool(1, 0)) break;
+                continue;
+            }
+
             h_cand = {};
             h_cand.cap = MAX_CANDIDATES;
             CUDA_CHECK(cudaMemcpy(d_cand, &h_cand, sizeof(h_cand), cudaMemcpyHostToDevice));
@@ -898,6 +919,7 @@ int main(int argc, char **argv) {
                 fs.avg_hps = avg_hps;
                 fs.total = total_hashes;
                 fs.submitted = submitted;
+                fs.pending = pending_submits.size();
                 fs.accepted = accepted;
                 fs.rejected = rejected;
                 fs.candidates = candidates;
@@ -921,6 +943,7 @@ int main(int argc, char **argv) {
             if (found_count > 0) {
                 candidates += found_count;
                 fs.candidates = candidates;
+                fs.pending = pending_submits.size();
                 fs.status = "candidate";
                 write_stats_file(opt, fs);
                 if (!opt.quiet) fprintf(stderr, "candidates=%u first_nonce=%" PRIu64 " first_hash=%s\n",
@@ -928,6 +951,21 @@ int main(int argc, char **argv) {
                 bool submit_ok = true;
                 uint32_t submit_count = found_count;
                 if (submit_count > opt.max_submit_per_batch) submit_count = opt.max_submit_per_batch;
+                if (opt.max_outstanding_shares > 0) {
+                    size_t outstanding = pending_submits.size();
+                    if (outstanding >= opt.max_outstanding_shares) {
+                        submit_count = 0;
+                    } else {
+                        uint32_t room = opt.max_outstanding_shares - (uint32_t)outstanding;
+                        if (submit_count > room) submit_count = room;
+                    }
+                }
+                if (submit_count == 0) {
+                    fs.pending = pending_submits.size();
+                    fs.status = "waiting replies";
+                    write_stats_file(opt, fs);
+                    if (!drain_pool(1, 0)) break;
+                }
                 for (uint32_t i = 0; i < submit_count; i++) {
                     char buf[512];
                     uint64_t submit_id = next_submit_id++;
@@ -937,6 +975,7 @@ int main(int argc, char **argv) {
                     submitted++;
                     pending_submits.emplace_back(submit_id, std::chrono::steady_clock::now());
                     fs.submitted = submitted;
+                    fs.pending = pending_submits.size();
                     write_stats_file(opt, fs);
                     if (!send_all(fd, buf)) {
                         submit_ok = false;

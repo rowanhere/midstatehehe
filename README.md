@@ -57,6 +57,9 @@ not waste valid shares that occur after the first hit in a launch.
 By default the miner submits only one share per GPU batch so the Midstate pool's
 expensive share validation does not get flooded; raise `--max-submit-per-batch`
 only after accepted/rejected responses are keeping up.
+The miner also limits unanswered Stratum submissions per GPU with
+`--max-outstanding-shares` so a slow pool cannot build an invisible response
+backlog while `submitted` climbs.
 Ctrl+C asks all GPU workers to stop and force-kills any worker that remains
 inside a long CUDA launch for more than a couple seconds.
 
@@ -94,6 +97,7 @@ Defaults are conservative for Pascal:
 --threads 128
 --batch 524288
 --max-submit-per-batch 1
+--max-outstanding-shares 8
 ```
 
 Try:
@@ -102,6 +106,7 @@ Try:
 ./midstate-cuda-miner -o stratum+tcp://127.0.0.1:3333 -a <MSS> -w test --blocks 8192 --threads 128
 ./midstate-cuda-miner -o stratum+tcp://127.0.0.1:3333 -a <MSS> -w test --blocks 8192 --threads 256
 ./midstate-cuda-miner -o stratum+tcp://127.0.0.1:3333 -a <MSS> -w test --max-submit-per-batch 2
+./midstate-cuda-miner -o stratum+tcp://127.0.0.1:3333 -a <MSS> -w test --max-submit-per-batch 2 --max-outstanding-shares 4
 ```
 
 Higher hashrate is good only if accepted shares also increase.
