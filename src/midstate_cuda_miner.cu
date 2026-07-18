@@ -45,6 +45,9 @@ struct Options {
     int blocks = 4096;
     int threads = 128;
     uint64_t batch = 524288;
+    uint64_t seed = 0;
+    int lane_index = 0;
+    int lane_count = 1;
 };
 
 struct Candidate {
@@ -207,6 +210,9 @@ static bool parse_args(int argc, char **argv, Options &o, uint32_t &iters) {
         else if (a == "--threads") o.threads = atoi(need(a.c_str()));
         else if (a == "--batch") o.batch = strtoull(need(a.c_str()), nullptr, 10);
         else if (a == "--iters") iters = (uint32_t)strtoul(need(a.c_str()), nullptr, 10);
+        else if (a == "--seed") o.seed = strtoull(need(a.c_str()), nullptr, 10);
+        else if (a == "--lane-index") o.lane_index = atoi(need(a.c_str()));
+        else if (a == "--lane-count") o.lane_count = atoi(need(a.c_str()));
         else if (a == "-h" || a == "--help") { usage(argv[0]); exit(0); }
         else { fprintf(stderr, "unknown option: %s\n", a.c_str()); return false; }
     }
@@ -341,7 +347,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "no CUDA GPUs found\n");
             return 1;
         }
-        fprintf(stderr, "auto mode: launching %d GPU worker(s)\n", device_count);
+        uint64_t auto_seed = opt.seed;
+        if (auto_seed == 0) {
+            auto_seed = ((uint64_t)time(nullptr) << 32) ^ (uint64_t)getpid();
+        }
+        fprintf(stderr, "auto mode: launching %d GPU worker(s), seed=%" PRIu64 "\n", device_count, auto_seed);
 
         std::vector<pid_t> children;
         for (int dev = 0; dev < device_count; dev++) {
@@ -358,6 +368,12 @@ int main(int argc, char **argv) {
                 args.emplace_back(std::to_string(dev));
                 args.emplace_back("-w");
                 args.emplace_back(opt.worker + "-gpu" + std::to_string(dev));
+                args.emplace_back("--seed");
+                args.emplace_back(std::to_string(auto_seed));
+                args.emplace_back("--lane-index");
+                args.emplace_back(std::to_string(dev));
+                args.emplace_back("--lane-count");
+                args.emplace_back(std::to_string(device_count));
 
                 std::vector<char *> cargs;
                 cargs.reserve(args.size() + 1);
@@ -421,7 +437,13 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    uint64_t base = ((uint64_t)time(nullptr) << 32) ^ (uint64_t)getpid();
+    if (opt.lane_count < 1) opt.lane_count = 1;
+    if (opt.lane_index < 0 || opt.lane_index >= opt.lane_count) opt.lane_index = 0;
+    uint64_t base_seed = opt.seed;
+    if (base_seed == 0) {
+        base_seed = ((uint64_t)time(nullptr) << 32) ^ (uint64_t)getpid();
+    }
+    uint64_t base = base_seed + (uint64_t)opt.lane_index * opt.batch;
     uint64_t job_id = 0;
     uint8_t job_midstate[32] = {0};
     bool have_job = false;
@@ -502,7 +524,7 @@ int main(int argc, char **argv) {
                     opt.address.c_str(), job_id, h_cand.nonce);
                 if (!send_all(fd, buf)) break;
             }
-            base += opt.batch;
+            base += opt.batch * (uint64_t)opt.lane_count;
         }
         close(fd);
         have_job = false;

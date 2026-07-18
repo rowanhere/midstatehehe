@@ -47,6 +47,8 @@ By default the miner auto-detects all CUDA GPUs and starts one worker per GPU:
 ```
 
 Workers are suffixed automatically: `rig-gpu0`, `rig-gpu1`, and so on.
+Auto mode also partitions nonce space across GPUs so cards do not duplicate
+each other's shares on the same pool job.
 
 To pin one GPU:
 
