@@ -63,6 +63,8 @@ backlog while `submitted` climbs.
 For private fast pools, Stratum submissions include the GPU-computed final hash
 with each nonce so the pool can score shares without repeating the full
 million-iteration extension on the CPU.
+Workers keep draining Stratum replies while CUDA kernels are running, so accepted
+share responses do not wait behind long GPU batches.
 Ctrl+C asks all GPU workers to stop and force-kills any worker that remains
 inside a long CUDA launch for more than a couple seconds.
 

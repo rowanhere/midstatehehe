@@ -33,7 +33,7 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_signal_count = 0;
-static constexpr const char *APP_VERSION = "v0.1.13";
+static constexpr const char *APP_VERSION = "v0.1.14";
 static constexpr uint32_t MAX_CANDIDATES = 512;
 
 static void on_sigint(int) {
@@ -723,10 +723,12 @@ int main(int argc, char **argv) {
     uint8_t *d_midstate = nullptr;
     uint8_t *d_target = nullptr;
     Candidate *d_cand = nullptr;
+    cudaEvent_t kernel_done;
     Candidate h_cand;
     CUDA_CHECK(cudaMalloc(&d_midstate, 32));
     CUDA_CHECK(cudaMalloc(&d_target, 32));
     CUDA_CHECK(cudaMalloc(&d_cand, sizeof(Candidate)));
+    CUDA_CHECK(cudaEventCreateWithFlags(&kernel_done, cudaEventDisableTiming));
     CUDA_CHECK(cudaMemcpy(d_target, share_target_host, 32, cudaMemcpyHostToDevice));
 
     std::string host, port;
@@ -903,7 +905,20 @@ int main(int argc, char **argv) {
             CUDA_CHECK(cudaMemcpy(d_cand, &h_cand, sizeof(h_cand), cudaMemcpyHostToDevice));
             mine_kernel<<<opt.blocks, opt.threads>>>(d_midstate, d_target, base, opt.batch, iterations, d_cand);
             CUDA_CHECK(cudaGetLastError());
-            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaEventRecord(kernel_done, 0));
+            bool connection_ok = true;
+            while (!g_stop) {
+                cudaError_t q = cudaEventQuery(kernel_done);
+                if (q == cudaSuccess) break;
+                if (q != cudaErrorNotReady) CUDA_CHECK(q);
+                if (!drain_pool(0, 1000)) {
+                    connection_ok = false;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (!connection_ok) break;
+            if (g_stop) CUDA_CHECK(cudaDeviceSynchronize());
             checked += opt.batch;
             total_hashes += opt.batch;
             CUDA_CHECK(cudaMemcpy(&h_cand, d_cand, sizeof(h_cand), cudaMemcpyDeviceToHost));
@@ -1001,5 +1016,6 @@ int main(int argc, char **argv) {
     cudaFree(d_midstate);
     cudaFree(d_target);
     cudaFree(d_cand);
+    cudaEventDestroy(kernel_done);
     return 0;
 }
