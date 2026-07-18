@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -18,7 +19,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -48,6 +53,10 @@ struct Options {
     uint64_t seed = 0;
     int lane_index = 0;
     int lane_count = 1;
+    bool dashboard = true;
+    bool quiet = false;
+    bool child = false;
+    std::string stats_dir;
 };
 
 struct Candidate {
@@ -186,7 +195,8 @@ __global__ void mine_kernel(
 static void usage(const char *argv0) {
     fprintf(stderr,
         "Usage: %s -o stratum+tcp://host:port -a ADDRESS [-w worker] [-d device]\n"
-        "          [--blocks N] [--threads N] [--batch N] [--iters N]\n\n"
+        "          [--blocks N] [--threads N] [--batch N] [--iters N]\n"
+        "          [--no-dashboard]\n\n"
         "Defaults: all GPUs, --blocks 4096 --threads 128 --batch 524288 --iters 1000000\n",
         argv0);
 }
@@ -213,10 +223,178 @@ static bool parse_args(int argc, char **argv, Options &o, uint32_t &iters) {
         else if (a == "--seed") o.seed = strtoull(need(a.c_str()), nullptr, 10);
         else if (a == "--lane-index") o.lane_index = atoi(need(a.c_str()));
         else if (a == "--lane-count") o.lane_count = atoi(need(a.c_str()));
+        else if (a == "--stats-dir") o.stats_dir = need(a.c_str());
+        else if (a == "--no-dashboard") o.dashboard = false;
+        else if (a == "--quiet") o.quiet = true;
+        else if (a == "--child") o.child = true;
         else if (a == "-h" || a == "--help") { usage(argv[0]); exit(0); }
         else { fprintf(stderr, "unknown option: %s\n", a.c_str()); return false; }
     }
     return !o.address.empty();
+}
+
+static std::string format_elapsed(uint64_t seconds) {
+    char buf[32];
+    uint64_t h = seconds / 3600;
+    uint64_t m = (seconds % 3600) / 60;
+    uint64_t s = seconds % 60;
+    snprintf(buf, sizeof(buf), "%02" PRIu64 ":%02" PRIu64 ":%02" PRIu64, h, m, s);
+    return buf;
+}
+
+static std::string format_hashrate(double hps) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2);
+    if (hps >= 1e12) out << (hps / 1e12) << " TH/s";
+    else if (hps >= 1e9) out << (hps / 1e9) << " GH/s";
+    else if (hps >= 1e6) out << (hps / 1e6) << " MH/s";
+    else if (hps >= 1e3) out << (hps / 1e3) << " kH/s";
+    else out << hps << " H/s";
+    return out.str();
+}
+
+static std::string short_text(const std::string &s, size_t n) {
+    if (s.size() <= n) return s;
+    if (n <= 3) return s.substr(0, n);
+    return s.substr(0, n - 3) + "...";
+}
+
+struct FileStats {
+    int gpu = -1;
+    std::string name = "-";
+    std::string worker = "-";
+    std::string status = "starting";
+    std::string job = "-";
+    double hps = 0.0;
+    double avg_hps = 0.0;
+    uint64_t total = 0;
+    uint64_t submitted = 0;
+    uint64_t accepted = 0;
+    uint64_t rejected = 0;
+    uint64_t candidates = 0;
+    uint64_t last_share_age = 0;
+};
+
+static std::string stats_path(const std::string &dir, int gpu) {
+    return dir + "/gpu" + std::to_string(gpu) + ".stat";
+}
+
+static void write_stats_file(const Options &opt, const FileStats &s) {
+    if (opt.stats_dir.empty()) return;
+    std::string path = stats_path(opt.stats_dir, opt.device);
+    std::string tmp = path + ".tmp";
+    std::ofstream out(tmp);
+    if (!out) return;
+    out << "gpu=" << s.gpu << "\n";
+    out << "name=" << s.name << "\n";
+    out << "worker=" << s.worker << "\n";
+    out << "status=" << s.status << "\n";
+    out << "job=" << s.job << "\n";
+    out << "hps=" << std::fixed << std::setprecision(3) << s.hps << "\n";
+    out << "avg_hps=" << std::fixed << std::setprecision(3) << s.avg_hps << "\n";
+    out << "total=" << s.total << "\n";
+    out << "submitted=" << s.submitted << "\n";
+    out << "accepted=" << s.accepted << "\n";
+    out << "rejected=" << s.rejected << "\n";
+    out << "candidates=" << s.candidates << "\n";
+    out << "last_share_age=" << s.last_share_age << "\n";
+    out.close();
+    rename(tmp.c_str(), path.c_str());
+}
+
+static FileStats read_stats_file(const std::string &path) {
+    FileStats s;
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = line.substr(0, eq);
+        std::string v = line.substr(eq + 1);
+        if (k == "gpu") s.gpu = atoi(v.c_str());
+        else if (k == "name") s.name = v;
+        else if (k == "worker") s.worker = v;
+        else if (k == "status") s.status = v;
+        else if (k == "job") s.job = v;
+        else if (k == "hps") s.hps = atof(v.c_str());
+        else if (k == "avg_hps") s.avg_hps = atof(v.c_str());
+        else if (k == "total") s.total = strtoull(v.c_str(), nullptr, 10);
+        else if (k == "submitted") s.submitted = strtoull(v.c_str(), nullptr, 10);
+        else if (k == "accepted") s.accepted = strtoull(v.c_str(), nullptr, 10);
+        else if (k == "rejected") s.rejected = strtoull(v.c_str(), nullptr, 10);
+        else if (k == "candidates") s.candidates = strtoull(v.c_str(), nullptr, 10);
+        else if (k == "last_share_age") s.last_share_age = strtoull(v.c_str(), nullptr, 10);
+    }
+    return s;
+}
+
+static void render_dashboard(
+    const Options &opt,
+    const std::string &stats_dir,
+    int device_count,
+    const std::chrono::steady_clock::time_point &started) {
+    std::vector<FileStats> snap;
+    snap.reserve(device_count);
+    for (int i = 0; i < device_count; i++) {
+        FileStats s = read_stats_file(stats_path(stats_dir, i));
+        if (s.gpu < 0) s.gpu = i;
+        snap.push_back(s);
+    }
+
+    double total_hps = 0.0;
+    uint64_t total_hashes = 0, submitted = 0, accepted = 0, rejected = 0, candidates = 0;
+    for (const auto &s : snap) {
+        total_hps += s.hps;
+        total_hashes += s.total;
+        submitted += s.submitted;
+        accepted += s.accepted;
+        rejected += s.rejected;
+        candidates += s.candidates;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    uint64_t elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - started).count();
+    double avg_hps = elapsed > 0 ? (double)total_hashes / (double)elapsed : 0.0;
+
+    std::ostringstream out;
+    out << "\033[H\033[2J";
+    out << "midstate-cuda-miner - NVIDIA CUDA Stratum miner\n";
+    out << "Pool: " << opt.pool << "    Address: " << short_text(opt.address, 24)
+        << "    Worker: " << opt.worker << "\n";
+    out << "Uptime: " << format_elapsed(elapsed)
+        << "    Current: " << format_hashrate(total_hps)
+        << "    Average: " << format_hashrate(avg_hps)
+        << "    GPUs: " << device_count << "\n";
+    out << "Shares: accepted " << accepted
+        << " | rejected " << rejected
+        << " | submitted " << submitted
+        << " | candidates " << candidates << "\n\n";
+
+    out << std::left
+        << std::setw(5) << "GPU"
+        << std::setw(27) << "Device"
+        << std::setw(15) << "Current"
+        << std::setw(15) << "Average"
+        << std::setw(10) << "Acc/Rej"
+        << std::setw(11) << "Submitted"
+        << std::setw(12) << "Job"
+        << "Status\n";
+    out << std::string(103, '-') << "\n";
+
+    for (const auto &s : snap) {
+        std::string accrej = std::to_string(s.accepted) + "/" + std::to_string(s.rejected);
+        out << std::left
+            << std::setw(5) << ("#" + std::to_string(s.gpu))
+            << std::setw(27) << short_text(s.name, 26)
+            << std::setw(15) << format_hashrate(s.hps)
+            << std::setw(15) << format_hashrate(s.avg_hps)
+            << std::setw(10) << accrej
+            << std::setw(11) << s.submitted
+            << std::setw(12) << short_text(s.job, 11)
+            << short_text(s.status, 24) << "\n";
+    }
+
+    std::cout << out.str() << std::flush;
 }
 
 static bool parse_pool_url(const std::string &url, std::string &host, std::string &port) {
@@ -351,9 +529,15 @@ int main(int argc, char **argv) {
         if (auto_seed == 0) {
             auto_seed = ((uint64_t)time(nullptr) << 32) ^ (uint64_t)getpid();
         }
+        std::string stats_dir = opt.stats_dir;
+        if (stats_dir.empty()) {
+            stats_dir = "/tmp/midstate-cuda-miner-" + std::to_string((long long)getpid());
+        }
+        mkdir(stats_dir.c_str(), 0700);
         fprintf(stderr, "auto mode: launching %d GPU worker(s), seed=%" PRIu64 "\n", device_count, auto_seed);
 
         std::vector<pid_t> children;
+        auto dashboard_started = std::chrono::steady_clock::now();
         for (int dev = 0; dev < device_count; dev++) {
             pid_t pid = fork();
             if (pid < 0) {
@@ -374,6 +558,12 @@ int main(int argc, char **argv) {
                 args.emplace_back(std::to_string(dev));
                 args.emplace_back("--lane-count");
                 args.emplace_back(std::to_string(device_count));
+                args.emplace_back("--stats-dir");
+                args.emplace_back(stats_dir);
+                args.emplace_back("--child");
+                if (opt.dashboard) {
+                    args.emplace_back("--quiet");
+                }
 
                 std::vector<char *> cargs;
                 cargs.reserve(args.size() + 1);
@@ -387,6 +577,9 @@ int main(int argc, char **argv) {
         }
 
         int rc = 0;
+        if (opt.dashboard) {
+            std::cout << "\033[?1049h\033[?25l" << std::flush;
+        }
         while (!children.empty()) {
             if (g_stop) {
                 for (pid_t pid : children) {
@@ -406,8 +599,15 @@ int main(int argc, char **argv) {
             }
 
             if (!children.empty()) {
+                if (opt.dashboard) {
+                    render_dashboard(opt, stats_dir, device_count, dashboard_started);
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
+        }
+        if (opt.dashboard) {
+            render_dashboard(opt, stats_dir, device_count, dashboard_started);
+            std::cout << "\033[?25h\033[?1049l" << std::flush;
         }
         return rc;
     }
@@ -415,7 +615,9 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaSetDevice(opt.device));
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, opt.device));
-    fprintf(stderr, "CUDA device %d: %s, cc %d.%d\n", opt.device, prop.name, prop.major, prop.minor);
+    if (!opt.quiet) {
+        fprintf(stderr, "CUDA device %d: %s, cc %d.%d\n", opt.device, prop.name, prop.major, prop.minor);
+    }
 
     uint8_t share_target_host[32];
     memset(share_target_host, 0xff, sizeof(share_target_host));
@@ -447,17 +649,31 @@ int main(int argc, char **argv) {
     uint64_t job_id = 0;
     uint8_t job_midstate[32] = {0};
     bool have_job = false;
-    uint64_t accepted = 0, rejected = 0, checked = 0;
+    uint64_t accepted = 0, rejected = 0, checked = 0, total_hashes = 0, submitted = 0, candidates = 0;
+    double current_hps = 0.0;
     auto t0 = std::chrono::steady_clock::now();
+    auto started = t0;
+    auto last_share = started;
+    bool has_share = false;
+    FileStats fs;
+    fs.gpu = opt.device;
+    fs.name = prop.name;
+    fs.worker = opt.worker;
+    fs.status = "starting";
+    write_stats_file(opt, fs);
 
     while (!g_stop) {
         int fd = connect_tcp(host, port);
         if (fd < 0) {
-            fprintf(stderr, "connect failed; retrying in 5s\n");
+            fs.status = "connect failed";
+            write_stats_file(opt, fs);
+            if (!opt.quiet) fprintf(stderr, "connect failed; retrying in 5s\n");
             std::this_thread::sleep_for(std::chrono::seconds(5));
             continue;
         }
-        fprintf(stderr, "connected to %s:%s\n", host.c_str(), port.c_str());
+        fs.status = "connected";
+        write_stats_file(opt, fs);
+        if (!opt.quiet) fprintf(stderr, "connected to %s:%s\n", host.c_str(), port.c_str());
 
         std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n";
         std::string auth = "{\"id\":1,\"method\":\"mining.authorize\",\"params\":[\"" +
@@ -484,16 +700,29 @@ int main(int argc, char **argv) {
                     memcpy(job_midstate, ms, 32);
                     CUDA_CHECK(cudaMemcpy(d_midstate, job_midstate, 32, cudaMemcpyHostToDevice));
                     have_job = true;
-                    fprintf(stderr, "new job %" PRIu64 " midstate=%s\n", job_id, hash_hex(job_midstate).c_str());
+                    fs.job = std::to_string(job_id);
+                    fs.status = "mining";
+                    write_stats_file(opt, fs);
+                    if (!opt.quiet) fprintf(stderr, "new job %" PRIu64 " midstate=%s\n", job_id, hash_hex(job_midstate).c_str());
                 } else if (line.find("\"id\":1") != std::string::npos &&
                            line.find("\"result\":true") != std::string::npos) {
-                    fprintf(stderr, "pool handshake ok\n");
+                    fs.status = "handshake ok";
+                    write_stats_file(opt, fs);
+                    if (!opt.quiet) fprintf(stderr, "pool handshake ok\n");
                 } else if (is_accepted(line)) {
                     accepted++;
-                    fprintf(stderr, "share accepted (%" PRIu64 " acc / %" PRIu64 " rej)\n", accepted, rejected);
+                    has_share = true;
+                    last_share = std::chrono::steady_clock::now();
+                    fs.accepted = accepted;
+                    fs.status = "share accepted";
+                    write_stats_file(opt, fs);
+                    if (!opt.quiet) fprintf(stderr, "share accepted (%" PRIu64 " acc / %" PRIu64 " rej)\n", accepted, rejected);
                 } else if (is_rejected(line) || has_non_null_error(line)) {
                     rejected++;
-                    fprintf(stderr, "share rejected: %s\n", line.c_str());
+                    fs.rejected = rejected;
+                    fs.status = "share rejected";
+                    write_stats_file(opt, fs);
+                    if (!opt.quiet) fprintf(stderr, "share rejected: %s\n", line.c_str());
                 }
             }
 
@@ -505,31 +734,61 @@ int main(int argc, char **argv) {
             CUDA_CHECK(cudaGetLastError());
             CUDA_CHECK(cudaDeviceSynchronize());
             checked += opt.batch;
+            total_hashes += opt.batch;
             CUDA_CHECK(cudaMemcpy(&h_cand, d_cand, sizeof(h_cand), cudaMemcpyDeviceToHost));
 
             auto now = std::chrono::steady_clock::now();
             double secs = std::chrono::duration<double>(now - t0).count();
             if (secs >= 5.0) {
-                fprintf(stderr, "hashrate: %.2f H/s checked=%" PRIu64 " worker=%s\n",
-                    checked / secs, checked, opt.worker.c_str());
+                current_hps = checked / secs;
+                double avg_hps = std::chrono::duration<double>(now - started).count() > 0.0
+                    ? (double)total_hashes / std::chrono::duration<double>(now - started).count()
+                    : 0.0;
+                fs.hps = current_hps;
+                fs.avg_hps = avg_hps;
+                fs.total = total_hashes;
+                fs.submitted = submitted;
+                fs.accepted = accepted;
+                fs.rejected = rejected;
+                fs.candidates = candidates;
+                fs.last_share_age = has_share
+                    ? (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(now - last_share).count()
+                    : 0;
+                if (fs.status == "share accepted" || fs.status == "share rejected") {
+                    fs.status = "mining";
+                }
+                write_stats_file(opt, fs);
+                if (!opt.quiet) {
+                    fprintf(stderr, "hashrate: %.2f H/s checked=%" PRIu64 " worker=%s\n",
+                        current_hps, checked, opt.worker.c_str());
+                }
                 t0 = now;
                 checked = 0;
             }
 
             if (h_cand.found) {
-                fprintf(stderr, "candidate nonce=%" PRIu64 " hash=%s\n", h_cand.nonce, hash_hex(h_cand.hash).c_str());
+                candidates++;
+                fs.candidates = candidates;
+                fs.status = "candidate";
+                write_stats_file(opt, fs);
+                if (!opt.quiet) fprintf(stderr, "candidate nonce=%" PRIu64 " hash=%s\n", h_cand.nonce, hash_hex(h_cand.hash).c_str());
                 char buf[512];
                 snprintf(buf, sizeof(buf),
                     "{\"id\":2,\"method\":\"mining.submit\",\"params\":[\"%s\",%" PRIu64 ",%" PRIu64 "]}\n",
                     opt.address.c_str(), job_id, h_cand.nonce);
+                submitted++;
+                fs.submitted = submitted;
+                write_stats_file(opt, fs);
                 if (!send_all(fd, buf)) break;
             }
             base += opt.batch * (uint64_t)opt.lane_count;
         }
         close(fd);
         have_job = false;
+        fs.status = "disconnected";
+        write_stats_file(opt, fs);
         if (!g_stop) {
-            fprintf(stderr, "disconnected; retrying in 5s\n");
+            if (!opt.quiet) fprintf(stderr, "disconnected; retrying in 5s\n");
             std::this_thread::sleep_for(std::chrono::seconds(5));
         }
     }

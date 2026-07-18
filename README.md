@@ -49,6 +49,14 @@ By default the miner auto-detects all CUDA GPUs and starts one worker per GPU:
 Workers are suffixed automatically: `rig-gpu0`, `rig-gpu1`, and so on.
 Auto mode also partitions nonce space across GPUs so cards do not duplicate
 each other's shares on the same pool job.
+Auto mode shows a live terminal dashboard with current and average hashrate,
+accepted/rejected shares, submitted candidates, active job, and per-GPU status.
+
+For plain line logs:
+
+```bash
+./midstate-cuda-miner -o stratum+tcp://127.0.0.1:3333 -a <YOUR_MSS_ADDRESS> -w rig --no-dashboard
+```
 
 To pin one GPU:
 
