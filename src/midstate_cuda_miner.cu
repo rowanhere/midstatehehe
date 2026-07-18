@@ -33,7 +33,7 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_signal_count = 0;
-static constexpr const char *APP_VERSION = "v0.1.9";
+static constexpr const char *APP_VERSION = "v0.1.10";
 static constexpr uint32_t MAX_CANDIDATES = 512;
 
 static void on_sigint(int) {
@@ -736,7 +736,6 @@ int main(int argc, char **argv) {
     uint8_t job_midstate[32] = {0};
     bool have_job = false;
     uint64_t accepted = 0, rejected = 0, checked = 0, total_hashes = 0, submitted = 0, candidates = 0;
-    uint64_t next_submit_id = 1000;
     double current_hps = 0.0;
     auto t0 = std::chrono::steady_clock::now();
     auto started = t0;
@@ -791,7 +790,7 @@ int main(int argc, char **argv) {
 
             uint64_t response_id = 0;
             bool response_accepted = false;
-            if (parse_submit_response(line, response_id, response_accepted) && response_id >= 1000) {
+            if (parse_submit_response(line, response_id, response_accepted) && response_id == 2) {
                 auto now = std::chrono::steady_clock::now();
                 for (auto it = pending_submits.begin(); it != pending_submits.end(); ++it) {
                     if (it->first == response_id) {
@@ -930,12 +929,11 @@ int main(int argc, char **argv) {
                 if (submit_count > opt.max_submit_per_batch) submit_count = opt.max_submit_per_batch;
                 for (uint32_t i = 0; i < submit_count; i++) {
                     char buf[512];
-                    uint64_t submit_id = next_submit_id++;
                     snprintf(buf, sizeof(buf),
-                        "{\"id\":%" PRIu64 ",\"method\":\"mining.submit\",\"params\":[\"%s\",%" PRIu64 ",%" PRIu64 "]}\n",
-                        submit_id, opt.address.c_str(), job_id, h_cand.nonce[i]);
+                        "{\"id\":2,\"method\":\"mining.submit\",\"params\":[\"%s\",%" PRIu64 ",%" PRIu64 "]}\n",
+                        opt.address.c_str(), job_id, h_cand.nonce[i]);
                     submitted++;
-                    pending_submits.emplace_back(submit_id, std::chrono::steady_clock::now());
+                    pending_submits.emplace_back(2, std::chrono::steady_clock::now());
                     fs.submitted = submitted;
                     write_stats_file(opt, fs);
                     if (!send_all(fd, buf)) {
@@ -944,7 +942,7 @@ int main(int argc, char **argv) {
                     }
                 }
                 if (!submit_ok) break;
-                if (!drain_pool(0, 0)) break;
+                if (!drain_pool(2, 0)) break;
             }
             base += opt.batch * (uint64_t)opt.lane_count;
         }
