@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <cuda_runtime.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -32,7 +33,7 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_signal_count = 0;
-static constexpr const char *APP_VERSION = "v0.1.7";
+static constexpr const char *APP_VERSION = "v0.1.8";
 static constexpr uint32_t MAX_CANDIDATES = 512;
 
 static void on_sigint(int) {
@@ -369,6 +370,8 @@ static void render_dashboard(
 
     double total_hps = 0.0;
     uint64_t total_hashes = 0, submitted = 0, accepted = 0, rejected = 0, candidates = 0;
+    int64_t latency_sum = 0, connect_sum = 0;
+    int latency_count = 0, connect_count = 0;
     for (const auto &s : snap) {
         total_hps += s.hps;
         total_hashes += s.total;
@@ -376,11 +379,21 @@ static void render_dashboard(
         accepted += s.accepted;
         rejected += s.rejected;
         candidates += s.candidates;
+        if (s.latency_ms >= 0) {
+            latency_sum += s.latency_ms;
+            latency_count++;
+        }
+        if (s.connect_ms >= 0) {
+            connect_sum += s.connect_ms;
+            connect_count++;
+        }
     }
 
     auto now = std::chrono::steady_clock::now();
     uint64_t elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - started).count();
     double avg_hps = elapsed > 0 ? (double)total_hashes / (double)elapsed : 0.0;
+    int64_t pool_latency_ms = latency_count > 0 ? latency_sum / latency_count : -1;
+    int64_t pool_connect_ms = connect_count > 0 ? connect_sum / connect_count : -1;
 
     std::ostringstream out;
     out << "\033[H\033[2J";
@@ -390,7 +403,9 @@ static void render_dashboard(
     out << "Uptime: " << format_elapsed(elapsed)
         << "    Current: " << format_hashrate(total_hps)
         << "    Average: " << format_hashrate(avg_hps)
-        << "    GPUs: " << device_count << "\n";
+        << "    GPUs: " << device_count
+        << "    Latency: " << format_ms(pool_latency_ms)
+        << "    Connect: " << format_ms(pool_connect_ms) << "\n";
     out << "Shares: accepted " << accepted
         << " | rejected " << rejected
         << " | submitted " << submitted
@@ -403,11 +418,9 @@ static void render_dashboard(
         << std::setw(15) << "Average"
         << std::setw(10) << "Acc/Rej"
         << std::setw(11) << "Submitted"
-        << std::setw(11) << "Latency"
-        << std::setw(10) << "Connect"
         << std::setw(12) << "Job"
         << "Status\n";
-    out << std::string(124, '-') << "\n";
+    out << std::string(103, '-') << "\n";
 
     for (const auto &s : snap) {
         std::string accrej = std::to_string(s.accepted) + "/" + std::to_string(s.rejected);
@@ -418,8 +431,6 @@ static void render_dashboard(
             << std::setw(15) << format_hashrate(s.avg_hps)
             << std::setw(10) << accrej
             << std::setw(11) << s.submitted
-            << std::setw(11) << format_ms(s.latency_ms)
-            << std::setw(10) << format_ms(s.connect_ms)
             << std::setw(12) << short_text(s.job, 11)
             << short_text(s.status, 24) << "\n";
     }
@@ -478,16 +489,32 @@ static bool send_all(int fd, const std::string &s) {
     return true;
 }
 
-static bool read_line(int fd, std::string &line) {
-    line.clear();
-    char c;
-    while (true) {
-        ssize_t n = recv(fd, &c, 1, 0);
-        if (n <= 0) return false;
-        if (c == '\n') return true;
-        if (c != '\r') line.push_back(c);
+struct LineReader {
+    int fd;
+    std::string buf;
+
+    explicit LineReader(int socket_fd) : fd(socket_fd) {
+        buf.reserve(65536);
     }
-}
+
+    bool read_line(std::string &line) {
+        line.clear();
+        while (true) {
+            size_t nl = buf.find('\n');
+            if (nl != std::string::npos) {
+                line = buf.substr(0, nl);
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                buf.erase(0, nl + 1);
+                return true;
+            }
+
+            char tmp[8192];
+            ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+            if (n <= 0) return false;
+            buf.append(tmp, (size_t)n);
+        }
+    }
+};
 
 static int hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -520,11 +547,20 @@ static std::string hash_hex(const uint8_t h[32]) {
 
 static bool parse_notify(const std::string &line, uint64_t &job_id, uint8_t midstate[32]) {
     if (line.find("mining.notify") == std::string::npos) return false;
-    std::regex re("\"params\"\\s*:\\s*\\[\\s*([0-9]+)\\s*,\\s*\"([0-9a-fA-F]{64})\"");
-    std::smatch m;
-    if (!std::regex_search(line, m, re)) return false;
-    job_id = strtoull(m[1].str().c_str(), nullptr, 10);
-    return hex_to_32(m[2].str(), midstate);
+    size_t params = line.find("\"params\"");
+    if (params == std::string::npos) return false;
+    size_t p = line.find('[', params);
+    if (p == std::string::npos) return false;
+    p++;
+    while (p < line.size() && isspace((unsigned char)line[p])) p++;
+    size_t num_start = p;
+    while (p < line.size() && line[p] >= '0' && line[p] <= '9') p++;
+    if (p == num_start) return false;
+    job_id = strtoull(line.substr(num_start, p - num_start).c_str(), nullptr, 10);
+    p = line.find('"', p);
+    if (p == std::string::npos || p + 65 > line.size()) return false;
+    std::string hex = line.substr(p + 1, 64);
+    return hex_to_32(hex, midstate);
 }
 
 static bool parse_submit_response(const std::string &line, uint64_t &id, bool &accepted) {
@@ -726,6 +762,7 @@ int main(int argc, char **argv) {
         fs.connect_ms = connect_ms;
         write_stats_file(opt, fs);
         if (!opt.quiet) fprintf(stderr, "connected to %s:%s\n", host.c_str(), port.c_str());
+        LineReader line_reader(fd);
 
         std::string sub = "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[]}\n";
         std::string auth = "{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"" +
@@ -787,7 +824,7 @@ int main(int argc, char **argv) {
             }
             if (line.find("\"id\":2") != std::string::npos &&
                 line.find("\"result\":true") != std::string::npos) {
-                fs.status = "handshake ok";
+                fs.status = have_job ? "mining" : "waiting job";
                 write_stats_file(opt, fs);
                 if (!opt.quiet) fprintf(stderr, "pool authorize ok\n");
                 return true;
@@ -815,7 +852,7 @@ int main(int argc, char **argv) {
                 }
                 if (sr == 0 || !FD_ISSET(fd, &rfds)) return true;
                 std::string line;
-                if (!read_line(fd, line)) return false;
+                if (!line_reader.read_line(line)) return false;
                 process_pool_line(line);
                 sec = 0;
                 usec = 0;
