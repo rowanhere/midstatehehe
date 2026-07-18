@@ -33,7 +33,7 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static volatile sig_atomic_t g_signal_count = 0;
-static constexpr const char *APP_VERSION = "v0.1.12";
+static constexpr const char *APP_VERSION = "v0.1.13";
 static constexpr uint32_t MAX_CANDIDATES = 512;
 
 static void on_sigint(int) {
@@ -969,9 +969,10 @@ int main(int argc, char **argv) {
                 for (uint32_t i = 0; i < submit_count; i++) {
                     char buf[512];
                     uint64_t submit_id = next_submit_id++;
+                    std::string final_hash = hash_hex(h_cand.hash[i]);
                     snprintf(buf, sizeof(buf),
-                        "{\"id\":%" PRIu64 ",\"method\":\"mining.submit\",\"params\":[\"%s\",%" PRIu64 ",%" PRIu64 "]}\n",
-                        submit_id, opt.address.c_str(), job_id, h_cand.nonce[i]);
+                        "{\"id\":%" PRIu64 ",\"method\":\"mining.submit\",\"params\":[\"%s\",%" PRIu64 ",%" PRIu64 ",\"%s\"]}\n",
+                        submit_id, opt.address.c_str(), job_id, h_cand.nonce[i], final_hash.c_str());
                     submitted++;
                     pending_submits.emplace_back(submit_id, std::chrono::steady_clock::now());
                     fs.submitted = submitted;

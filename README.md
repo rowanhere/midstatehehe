@@ -60,6 +60,9 @@ only after accepted/rejected responses are keeping up.
 The miner also limits unanswered Stratum submissions per GPU with
 `--max-outstanding-shares` so a slow pool cannot build an invisible response
 backlog while `submitted` climbs.
+For private fast pools, Stratum submissions include the GPU-computed final hash
+with each nonce so the pool can score shares without repeating the full
+million-iteration extension on the CPU.
 Ctrl+C asks all GPU workers to stop and force-kills any worker that remains
 inside a long CUDA launch for more than a couple seconds.
 
